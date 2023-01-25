@@ -1,0 +1,24 @@
+[package]
+name = "sbtree"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+async-trait = "*"
+serde_json = "*"
+serde = {version="*", features = ["derive"]}
+bincode = "*"
+base64 = "0.21.0"
+lru = "*"
+dashmap = "*"
+aws-sdk-dynamodb = "*"
+aws-config = "*"
+rusqlite = { version = "*", features = ["bundled"] }
+r2d2 = "*"
+r2d2_sqlite = "*"
+uuid = { version = "*", features = ["v4"]}
+chrono = {version="*", features=["serde"]}
+obelisk = {path="./obelisk"}
+obelisk_deployment = {package="deployment", path="./obelisk/deployment"}

@@ -1,0 +1,12 @@
+namespace = "essai"
+
+[functional]
+path = "sless_btree::EssaiFn"
+mem_size = 128
+timeout = 5
+concurrency = 1
+
+[messaging]
+path = "sless_btree::EssaiActor"
+mem_size = 1024
+timeout = 5

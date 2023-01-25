@@ -1,0 +1,10 @@
+namespace = "iofaas-basic"
+
+# functions = [] # If you only have services.
+services = []
+
+[[functions]]
+name="essai-fn"
+path="io_serverless::echo_factory"
+mem_size_mb=128
+disk_size_mb=512
