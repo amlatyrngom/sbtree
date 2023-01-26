@@ -6,15 +6,25 @@ mod tests {
 
     use crate::BTreeActor;
 
+    async fn reset_for_test() {
+        std::env::set_var("EXECUTION_MODE", "local");
+        let storage_dir = obelisk::common::shared_storage_prefix();
+        if let Err(e) = std::fs::remove_dir_all(&storage_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                panic!("Test directory could not be reset!");
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn simple_test() {
+        reset_for_test().await;
         run_simple_test().await;
     }
 
     async fn run_simple_test() {
-        // TODO: Delete data directory to reset test.
+        // Make btree actor.
         let name = "manager";
-        std::env::set_var("EXECUTION_MODE", "local");
         let plog = PersistentLog::new("sbtree", name).await;
         let btree_actor = BTreeActor::new(name, Arc::new(plog)).await;
         // The empty key always maps to the empty value.

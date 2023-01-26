@@ -357,7 +357,9 @@ impl BTreeStructure {
                     return;
                 }
             };
-            println!("BTreeStructure::split_or_merge_leaf(). Taking exclusive lock on {ownership_key}!");
+            println!(
+                "BTreeStructure::split_or_merge_leaf(). Taking exclusive lock on {ownership_key}!"
+            );
             let _exclusive_lock = ownership_lock.write_owned().await;
             let root_id = LocalOwnership::block_id_from_key(&ownership_key);
             let root = this
