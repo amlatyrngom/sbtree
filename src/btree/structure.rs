@@ -43,6 +43,7 @@ pub struct BTreeStructure {
 impl BTreeStructure {
     /// Create a new btree structure.
     pub async fn new(owner_id: &str, plog: Arc<PersistentLog>) -> Self {
+        println!("Creating global ownership!");
         let global_ownership = Arc::new(GlobalOwnership::new(Some(owner_id.into())).await);
         let block_cache = Arc::new(BlockCache::new().await);
         let ownership = global_ownership.fetch_ownership_keys().await;
@@ -90,6 +91,8 @@ impl BTreeStructure {
         self.global_ownership
             .add_ownership_key(&self.owner_id, &ownership_key)
             .await;
+        let mut ownership = self.ownership.write().await;
+        ownership.insert(ownership_key, Arc::new(RwLock::new(())));
     }
 
     /// Logic for rescaling.
@@ -105,7 +108,7 @@ impl BTreeStructure {
         if recovery.is_none() {
             // Do not repeat already performed operation.
             let running_state = self.running_state.read().await;
-            if &running_state.last_rescaling_uid == rescaling_uid {
+            if running_state.last_rescaling_uid == rescaling_uid {
                 return;
             }
         }
@@ -129,8 +132,7 @@ impl BTreeStructure {
                 let mut to_transfer = Vec::new();
                 let mut locks = Vec::new();
                 let mut ownership = self.ownership.write().await;
-                let mut i = 0;
-                for (ownership_key, ownership_lock) in ownership.iter() {
+                for (i, (ownership_key, ownership_lock)) in ownership.iter().enumerate() {
                     if remove_self {
                         locks.push(ownership_lock.clone().write_owned().await);
                         to_transfer.push(ownership_key.clone());
@@ -142,7 +144,6 @@ impl BTreeStructure {
                             to_transfer.push(ownership_key.clone());
                         }
                     }
-                    i += 1;
                 }
                 for k in &to_transfer {
                     ownership.remove(k);
@@ -304,6 +305,7 @@ impl BTreeStructure {
         key: &str,
     ) -> Result<(String, OwnedRwLockReadGuard<()>, usize), BTreeRespMeta> {
         let ownership = self.global_ownership.find_owner(key, true).await;
+        println!("Ownership key: {ownership:?}");
         let ownership_key = match ownership {
             None => return Err(BTreeRespMeta::InvariantIssue), // There should always be an owner.
             Some((ownership_key, owner_id)) => {
@@ -322,6 +324,7 @@ impl BTreeStructure {
         // Likewise, if an ownership change is ongoing, this will return BadOwner.
         let ownership = self.ownership.read().await;
         if !ownership.contains_key(&ownership_key) {
+            println!("Ownership: {ownership:?}");
             let this = self.clone();
             tokio::spawn(async move {
                 this.fetch_new_ownership().await;
@@ -333,6 +336,7 @@ impl BTreeStructure {
             Ok(lock) => lock,
             Err(_) => {
                 // There is an ongoing ownership change.
+                println!("Ownership Locked: {ownership:?}");
                 return Err(BTreeRespMeta::BadOwner);
             }
         };
@@ -353,6 +357,7 @@ impl BTreeStructure {
                     return;
                 }
             };
+            println!("BTreeStructure::split_or_merge_leaf(). Taking exclusive lock on {ownership_key}!");
             let _exclusive_lock = ownership_lock.write_owned().await;
             let root_id = LocalOwnership::block_id_from_key(&ownership_key);
             let root = this
@@ -464,7 +469,7 @@ impl BTreeStructure {
                 leaf_id,
                 split_key,
                 is_last,
-                (root.is_half_empty() && num_ownerships > 0) || root.is_full(),
+                (root.is_half_empty() && num_ownerships > 1) || root.is_full(),
             )
         };
         let leaf = self.block_cache.pin(&ownership_key, &leaf_id).await;
@@ -535,6 +540,7 @@ impl BTreeStructure {
                     return;
                 }
             };
+            println!("BTreeStructure::split_or_merge_ownership(). Taking exclusive lock on {ownership_key}!");
             let _ownership_lock = ownership_lock.write_owned().await;
             // Check if should merge or split.
             let root_id = LocalOwnership::block_id_from_key(&ownership_key);
@@ -562,15 +568,14 @@ impl BTreeStructure {
                         other_exclusive_lock,
                     } = this.find_adjacent_root(root.clone(), &ownership_key).await;
                     let _other_exclusive_lock = other_exclusive_lock;
-                    let _ = this
-                        .perform_root_merge(
-                            Some(from_root),
-                            &from_ownership_key,
-                            to_root,
-                            &to_ownership_key,
-                            None,
-                        )
-                        .await;
+                    this.perform_root_merge(
+                        Some(from_root),
+                        &from_ownership_key,
+                        to_root,
+                        &to_ownership_key,
+                        None,
+                    )
+                    .await;
                     // Unpin other block.
                     let other_ownership_key = if from_ownership_key != ownership_key {
                         from_ownership_key
@@ -639,20 +644,20 @@ impl BTreeStructure {
             };
             // Must write split leaf last for recovery.
             // First create new leaf.
-            let create_ch = self.block_cache.create(&ownership_key, new_leaf).await;
+            let create_ch = self.block_cache.create(ownership_key, new_leaf).await;
             create_ch.await.unwrap();
             // Then update root.
             root.insert(split_key, new_leaf_id.as_bytes().to_vec());
             let write_ch = self
                 .block_cache
-                .write_back(&ownership_key, &mut root)
+                .write_back(ownership_key, &mut root)
                 .await
                 .unwrap();
             write_ch.await.unwrap();
             // Finally, update split leaf.
             let write_ch = self
                 .block_cache
-                .write_back(&ownership_key, &mut leaf)
+                .write_back(ownership_key, &mut leaf)
                 .await
                 .unwrap();
             write_ch.await.unwrap();
@@ -713,12 +718,12 @@ impl BTreeStructure {
             // The merged-in keys must be synchronously written, or they will be lost.
             let write_ch1 = self
                 .block_cache
-                .write_back(&ownership_key, &mut leaf)
+                .write_back(ownership_key, &mut leaf)
                 .await
                 .unwrap();
             let write_ch2 = self
                 .block_cache
-                .write_back(&ownership_key, &mut root)
+                .write_back(ownership_key, &mut root)
                 .await
                 .unwrap();
             write_ch1.await.unwrap();
@@ -726,7 +731,7 @@ impl BTreeStructure {
             // The next leaf can now be deleted.
             let delete_ch = self
                 .block_cache
-                .write_back(&ownership_key, &mut from_leaf)
+                .write_back(ownership_key, &mut from_leaf)
                 .await
                 .unwrap();
             delete_ch.await.unwrap();
@@ -785,18 +790,18 @@ impl BTreeStructure {
             // Transfer ownership of blocks to new root.
             let to_transfer: Vec<String> = new_root
                 .data
-                .iter()
-                .map(|(_, block_id)| String::from_utf8(block_id.clone()).unwrap())
+                .values()
+                .map(|block_id| String::from_utf8(block_id.clone()).unwrap())
                 .collect();
             self.block_cache
-                .move_ownership(&ownership_key, &new_ownership_key, to_transfer)
+                .move_ownership(ownership_key, &new_ownership_key, to_transfer)
                 .await;
             // Write new root, then old root.
             let create_ch = self.block_cache.create(&new_ownership_key, new_root).await;
             create_ch.await.unwrap();
             let write_ch = self
                 .block_cache
-                .write_back(&ownership_key, &mut root)
+                .write_back(ownership_key, &mut root)
                 .await
                 .unwrap();
             write_ch.await.unwrap();
@@ -856,17 +861,17 @@ impl BTreeStructure {
             // Transfer ownership of blocks.
             let to_transfer: Vec<String> = from_root
                 .data
-                .iter()
-                .map(|(_, block_id)| String::from_utf8(block_id.clone()).unwrap())
+                .values()
+                .map(|block_id| String::from_utf8(block_id.clone()).unwrap())
                 .collect();
             self.block_cache
-                .move_ownership(&from_ownership_key, &to_ownership_key, to_transfer)
+                .move_ownership(from_ownership_key, to_ownership_key, to_transfer)
                 .await;
             // Merge and synchrously write.
             to_root.merge(&mut from_root);
             let write_ch = self
                 .block_cache
-                .write_back(&to_ownership_key, &mut to_root)
+                .write_back(to_ownership_key, &mut to_root)
                 .await
                 .unwrap();
             write_ch.await.unwrap();

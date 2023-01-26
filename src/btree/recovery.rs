@@ -56,7 +56,9 @@ impl RunningState {
             last_rescaling: self.last_rescaling_uid.clone(),
             is_active: self.is_active,
         };
-        Recovery::write_log_entry(self.plog.clone(), log_entry).await;
+        let log_entry = bincode::serialize(&log_entry).unwrap();
+        self.plog.enqueue(log_entry).await;
+        self.plog.flush(None).await;
     }
 }
 
@@ -68,11 +70,10 @@ pub struct Recovery {
 impl Recovery {
     pub async fn new(owner_id: &str, plog: Arc<PersistentLog>) -> Self {
         let tree_structure = BTreeStructure::new(owner_id, plog).await;
-        let recovery = Recovery {
+        Recovery {
             recovery_lock: Arc::new(RwLock::new(())),
             tree_structure,
-        };
-        recovery
+        }
     }
 
     pub async fn safe_truncate(tree_structure: Arc<BTreeStructure>) {
@@ -125,7 +126,9 @@ impl Recovery {
         let mut already_running = false;
         let mut to_replay: BTreeMap<usize, BTreeLogEntry> = BTreeMap::new();
         loop {
+            println!("Replaying from: {curr_start_lsn}");
             let entries = self.tree_structure.plog.replay(curr_start_lsn).await;
+            println!("Found entries: {}", entries.len());
             if entries.is_empty() {
                 break;
             }
@@ -287,18 +290,18 @@ impl Recovery {
         to_version: usize,
     ) {
         let _recovery_exclusive = self.recovery_lock.clone().write_owned().await;
-        let to_root_id = LocalOwnership::block_id_from_key(&to_ownership_key);
+        let to_root_id = LocalOwnership::block_id_from_key(to_ownership_key);
         let to_root = self
             .tree_structure
             .block_cache
-            .pin(&to_ownership_key, &to_root_id)
+            .pin(to_ownership_key, &to_root_id)
             .await
             .unwrap();
-        let from_root_id = LocalOwnership::block_id_from_key(&from_ownership_key);
+        let from_root_id = LocalOwnership::block_id_from_key(from_ownership_key);
         let from_root = self
             .tree_structure
             .block_cache
-            .pin(&from_ownership_key, &from_root_id)
+            .pin(from_ownership_key, &from_root_id)
             .await;
         // Recover
         self.tree_structure
@@ -325,7 +328,7 @@ impl Recovery {
         root_version: usize,
     ) {
         let _recovery_exclusive = self.recovery_lock.clone().write_owned().await;
-        let root_id = LocalOwnership::block_id_from_key(&ownership_key);
+        let root_id = LocalOwnership::block_id_from_key(ownership_key);
         let root = self
             .tree_structure
             .block_cache
@@ -357,13 +360,13 @@ impl Recovery {
         let leaf = self
             .tree_structure
             .block_cache
-            .pin(ownership_key, &leaf_id)
+            .pin(ownership_key, leaf_id)
             .await
             .unwrap();
         let root = self
             .tree_structure
             .block_cache
-            .pin(ownership_key, &root_id)
+            .pin(ownership_key, root_id)
             .await
             .unwrap();
         let from_leaf = self
@@ -386,7 +389,7 @@ impl Recovery {
         self.tree_structure.block_cache.unpin(leaf_id).await;
         self.tree_structure.block_cache.unpin(root_id).await;
         if from_leaf.is_some() {
-            self.tree_structure.block_cache.unpin(&from_leaf_id).await;
+            self.tree_structure.block_cache.unpin(from_leaf_id).await;
         }
     }
 
@@ -423,7 +426,7 @@ impl Recovery {
             .await;
         // Unpin.
         self.tree_structure.block_cache.unpin(leaf_id).await;
-        self.tree_structure.block_cache.unpin(&root_id).await;
+        self.tree_structure.block_cache.unpin(root_id).await;
     }
 
     async fn recover_delete(

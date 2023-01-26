@@ -68,10 +68,8 @@ impl BlockCache {
             ongoing_reads: HashSet::new(),
             ongoing_writes: HashMap::new(),
         }));
-        let total_mem: usize = std::env::var("MEMORY")
-            .unwrap_or("1".into())
-            .parse()
-            .unwrap();
+        let total_mem = std::env::var("MEMORY").unwrap_or_else(|_| "1".into());
+        let total_mem: usize = total_mem.parse().unwrap();
         // 80% of available memory. Rest should be for pinned stuff and for other data structures.
         let total_mem = (total_mem * (1024 * 1024) * 80) / 100;
         // Inner.
@@ -98,6 +96,18 @@ impl BlockCache {
         }
     }
 
+    /// For testing only.
+    #[cfg(test)]
+    pub async fn check_all_unpinned(&self, expected_unpinned_count: Option<usize>) {
+        let inner = self.inner.lock().await;
+        assert!(inner.pincounts.is_empty());
+        assert!(inner.pinned.is_empty());
+        if let Some(c) = expected_unpinned_count {
+            assert!(inner.unpinned.len() == c);
+            assert!(inner.unpinned_lru.len() == inner.unpinned.len());
+        }
+    }
+
     /// Get or make the db associated with this ownership.
     async fn get_or_make_db(&self, ownership_key: &str) -> LocalOwnership {
         let db = {
@@ -120,8 +130,7 @@ impl BlockCache {
     pub async fn remove_ownership_key(&self, ownership_key: &str, delete: bool) {
         let db = {
             let mut local_ownership = self.local_ownership.write().await;
-            let db = local_ownership.remove(ownership_key);
-            db
+            local_ownership.remove(ownership_key)
         };
         if delete {
             if let Some(db) = db {
@@ -216,7 +225,7 @@ impl BlockCache {
                 inner.pinned.insert(block_id.into(), block_ref.clone());
                 let pincount = inner.pincounts.get_mut(block_id).unwrap();
                 *pincount += 1;
-                Some(block_ref.clone())
+                Some(block_ref)
             }
         }
     }
@@ -233,7 +242,7 @@ impl BlockCache {
         force_fetch: bool,
     ) -> (Option<Arc<RwLock<TreeBlock>>>, bool) {
         // Return if already cached.
-        self.record_access(&block_id);
+        self.record_access(block_id);
         if !force_fetch {
             let block = self.get_or_insert(block_id, None).await;
             if block.is_some() {
@@ -392,10 +401,8 @@ impl BlockCache {
             let tree_block = tree_block.clone();
             tokio::spawn(async move {
                 // Serialize.
-                let data = tokio::task::block_in_place(move || {
-                    let data = bincode::serialize(&tree_block).unwrap();
-                    data
-                });
+                let data =
+                    tokio::task::block_in_place(move || bincode::serialize(&tree_block).unwrap());
                 // Wait for write turn.
                 Self::wait_for_write_turn(transfer.clone(), &block_id, write_version).await;
                 // Write.
@@ -493,7 +500,7 @@ impl TreeBlock {
 
     /// Find exact value for key.
     pub fn find_exact(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.data.get(key).map(|v| v.clone())
+        self.data.get(key).cloned()
     }
 
     /// Delete kv pair.

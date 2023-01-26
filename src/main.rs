@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &deployments,
     )
     .await;
-    // Create manager.
-    let _mc = obelisk::MessagingClient::new("sbtree", "manager").await;
+    // Create global tables and manager.
+    sbtree::make_deployment().await;
     Ok(())
 }

@@ -36,13 +36,13 @@ impl BTreeManager {
         };
         let req = serde_json::to_string(&req).unwrap();
         loop {
-            let resp = from_mc.send_message(&req, &vec![]).await;
+            let resp = from_mc.send_message(&req, &[]).await;
             if resp.is_some() {
                 break;
             }
         }
         loop {
-            let resp = to_mc.send_message(&req, &vec![]).await;
+            let resp = to_mc.send_message(&req, &[]).await;
             if resp.is_some() {
                 break;
             }
@@ -92,7 +92,7 @@ impl BTreeManager {
         let (lo, next_lo, hi) = {
             let mut loads: Vec<(String, f64)> = loads
                 .iter()
-                .map(|(w_id, load)| (w_id.clone(), load.clone()))
+                .map(|(w_id, load)| (w_id.clone(), *load))
                 .collect();
             loads.sort_by(|(_, load1), (_, load2)| load1.total_cmp(load2));
             let lo = loads.get(0);

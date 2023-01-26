@@ -157,23 +157,29 @@ impl BTreeActor {
     /// Make actor.
     pub async fn new(name: &str, plog: Arc<PersistentLog>) -> Self {
         // Attempt recovery.
-        println!("Recovering");
+        println!("BTreeActor::new(). Recovering...");
         let recovery = Recovery::new(name, plog.clone()).await;
         let (tree_structure, already_running) = recovery.recover().await;
-        println!("Recovered");
+        println!("BTreeActor::new(). Recovered");
         if !already_running {
+            println!("BTreeActor::new(). Initializing");
             tree_structure.initialize().await;
+            println!("BTreeActor::new(). Initialized");
         }
         // Mark as running and truncate all previous logs.
+        println!("BTreeActor::new(). Truncating");
         let old_flush_lsn = tree_structure.plog.get_flush_lsn().await;
         {
             let mut running_state = tree_structure.running_state.write().await;
             running_state.checkpoint().await;
         }
         tree_structure.plog.truncate(old_flush_lsn).await;
+        println!("BTreeActor::new(). Truncated");
         let tree_structure = Arc::new(tree_structure);
         let manager = if name == "manager" {
+            println!("BTreeActor::new(). Making manager");
             let manager = BTreeManager::new(tree_structure.global_ownership.clone()).await;
+            println!("BTreeActor::new(). Made manager");
             Some(Arc::new(manager))
         } else {
             None
@@ -212,7 +218,7 @@ impl BTreeActor {
         let mut last_load = std::time::Instant::now();
         loop {
             // Sleep a short duration.
-            tokio::time::sleep(sleep_duration.clone()).await;
+            tokio::time::sleep(sleep_duration).await;
             let now = std::time::Instant::now();
             // Check if should flush.
             if now.duration_since(last_flushing) > flush_duration {

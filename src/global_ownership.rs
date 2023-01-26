@@ -1,5 +1,8 @@
 use crate::btree::RescalingOp;
-use aws_sdk_dynamodb::model::AttributeValue;
+use aws_sdk_dynamodb::model::{
+    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
+    ScalarAttributeType,
+};
 use obelisk::MessagingClient;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
@@ -26,6 +29,7 @@ struct OwnershipInner {
 impl GlobalOwnership {
     /// Create.
     pub async fn new(owner_id: Option<String>) -> Self {
+        println!("Globalownership::new()");
         let shared_config = aws_config::load_from_env().await;
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
         let inner = Arc::new(RwLock::new(OwnershipInner {
@@ -42,13 +46,17 @@ impl GlobalOwnership {
         };
         if let Some(owner_id) = owner_id {
             if owner_id == "manager" {
+                println!("GlobalOwnership::new(). Recovering manager1");
                 ownership.mark_owner_state("manager", false).await;
+                println!("GlobalOwnership::new(). Recovering manager2");
                 ownership.recover_worker_states().await;
+                println!("GlobalOwnership::new(). Recovering manager3");
                 ownership.recover_rescaling().await;
             }
         }
+        println!("GlobalOwnership::new(). Recovering manager4");
         ownership.refresh_ownership_keys().await;
-
+        println!("GlobalOwnership::new(). Recovering manager5");
         ownership
     }
 
@@ -92,7 +100,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(resp) => {
@@ -143,7 +156,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(_resp) => break,
@@ -153,7 +171,7 @@ impl GlobalOwnership {
         if free {
             inner.free_owners.insert(owner_id.into());
         } else {
-            inner.free_owners.insert(owner_id.into());
+            inner.free_owners.remove(owner_id);
         }
     }
 
@@ -180,7 +198,6 @@ impl GlobalOwnership {
                         if x.contains("ConditionalCheckFailedException") {
                             return false;
                         }
-                        println!("{x:?}");
                         continue;
                     }
                     Ok(_resp) => break,
@@ -230,7 +247,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(resp) => match resp.item() {
@@ -260,7 +282,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(_resp) => break,
@@ -289,7 +316,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(_resp) => return,
@@ -311,7 +343,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(_resp) => return,
@@ -333,7 +370,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(resp) => {
@@ -382,7 +424,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(_resp) => break,
@@ -407,7 +454,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(_resp) => break,
@@ -431,7 +483,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(resp) => {
@@ -489,7 +546,12 @@ impl GlobalOwnership {
                 .await;
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
+                    let x = format!("{x:?}");
+                    if Self::is_normal_dynamo_error(&x) {
+                        // Sleep to avoid high request rate on dynamo.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        panic!("Bad dynamo error {x}");
+                    }
                     continue;
                 }
                 Ok(resp) => {
@@ -510,6 +572,7 @@ impl GlobalOwnership {
                     }
                     let mut inner = self.inner.write().unwrap();
                     inner.ownership_keys = ownership_keys;
+                    return;
                 }
             }
         }
@@ -533,5 +596,66 @@ impl GlobalOwnership {
             }
         };
         owner
+    }
+
+    async fn make_table_if_not_exist(table_name: &str, pkey: &str, skey: &str) {
+        let shared_config = aws_config::load_from_env().await;
+        let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
+        // key-value table.
+        let resp = dynamo_client
+            .create_table()
+            .table_name(table_name)
+            .billing_mode(BillingMode::PayPerRequest)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(pkey)
+                    .key_type(KeyType::Hash)
+                    .build(),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(skey)
+                    .key_type(KeyType::Range)
+                    .build(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(pkey)
+                    .attribute_type(ScalarAttributeType::S)
+                    .build(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(skey)
+                    .attribute_type(ScalarAttributeType::S)
+                    .build(),
+            )
+            .send()
+            .await;
+        if resp.is_err() {
+            let err = format!("{resp:?}");
+            if !err.contains("ResourceInUseException") {
+                eprintln!("Dynamodb request error: {resp:?}");
+                std::process::exit(1);
+            }
+        } else {
+            println!("Creating {table_name} table...");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    }
+
+    pub fn is_normal_dynamo_error(x: &str) -> bool {
+        x.contains("InternalServerError")
+            || x.contains(" ConditionalCheckFailedException ")
+            || x.contains("ResourceNotFoundException")
+            || x.contains("TransactionConflictException")
+            || x.contains("ConditionalCheckFailedException")
+    }
+
+    pub async fn make_tables_if_not_exist() {
+        let create1 =
+            Self::make_table_if_not_exist("sbtree_ownership", "owner_id", "ownership_key");
+        let create2 = Self::make_table_if_not_exist("sbtree_rescaling", "entry_type", "owner_id");
+        tokio::join!(create1, create2);
     }
 }

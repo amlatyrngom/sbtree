@@ -30,7 +30,7 @@ impl BTreeClient {
                 let req_meta = BTreeReqMeta::Manage;
                 let req_meta = serde_json::to_string(&req_meta).unwrap();
                 loop {
-                    let resp = mc.send_message(&req_meta, &vec![]).await;
+                    let resp = mc.send_message(&req_meta, &[]).await;
                     if resp.is_some() {
                         break;
                     }

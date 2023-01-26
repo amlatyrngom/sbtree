@@ -140,7 +140,7 @@ impl LocalOwnership {
             // to: INSERT INTO blocks(block_id, data) VALUES (chunk ids, chunk data).
             // from: DELETE FROM blocks WHERE block_id IN (chunk ids).
             let in_params = rusqlite::params_from_iter(chunk.iter());
-            let in_clause: Vec<String> = chunk.iter().map(|_| format!("?")).collect();
+            let in_clause: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
             let in_clause = in_clause.join(", ");
             let select_stmt =
                 format!("SELECT block_id, data FROM blocks WHERE block_id IN ({in_clause})");
@@ -298,7 +298,7 @@ impl LocalOwnership {
         let db_file = self.db_file.clone();
         std::mem::drop(self);
         tokio::task::block_in_place(move || loop {
-            let resp = std::fs::remove_file(&db_file);
+            let resp = std::fs::remove_file(db_file.clone());
             match resp {
                 Ok(_) => return,
                 Err(err) => match err.kind() {
@@ -312,8 +312,7 @@ impl LocalOwnership {
     /// Make a block from an ownership or a split key.
     /// TODO: I have yet to think about if these keys are truly unique.
     pub fn block_id_from_key(key: &str) -> String {
-        let block_id = general_purpose::URL_SAFE_NO_PAD.encode(key);
-        block_id
+        general_purpose::URL_SAFE_NO_PAD.encode(key)
     }
 
     /// Create database.
@@ -371,7 +370,7 @@ impl LocalOwnership {
             }
             let incarnation_num =
                 txn.query_row("SELECT incarnation_num FROM incarnation", [], |r| r.get(0));
-            let incarnation_num = incarnation_num.unwrap_or(0 as usize) + 1;
+            let incarnation_num = incarnation_num.unwrap_or(0_usize) + 1;
             match txn.execute(
                 "REPLACE INTO incarnation (unique_row, incarnation_num) VALUES (0, ?)",
                 [&incarnation_num],
