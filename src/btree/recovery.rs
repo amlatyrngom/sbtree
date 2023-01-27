@@ -33,7 +33,7 @@ impl RunningState {
     /// No need to log this since the split operation will be logged.
     pub fn get_next_block_id(&mut self) -> usize {
         let next_id = self.next_block_id;
-        self.next_block_id = 1;
+        self.next_block_id += 1;
         next_id
     }
 
@@ -76,10 +76,13 @@ impl Recovery {
         }
     }
 
+    /// Safely truncate log.
+    /// TODO: Might have to vacuum. But I think the free space will just be reused.
     pub async fn safe_truncate(tree_structure: Arc<BTreeStructure>) {
         let mut min_lsn_before = 0;
         let mut curr_start_lsn = 0;
-        let mut to_replay: BTreeMap<usize, ()> = BTreeMap::new();
+        let old_flush_lsn = tree_structure.plog.get_flush_lsn().await;
+        let mut to_replay: BTreeMap<usize, BTreeLogEntry> = BTreeMap::new();
         loop {
             let entries = tree_structure.plog.replay(curr_start_lsn).await;
             if entries.is_empty() {
@@ -103,7 +106,7 @@ impl Recovery {
                         // Do nothing.
                     }
                     _ => {
-                        to_replay.insert(lsn, ());
+                        to_replay.insert(lsn, entry);
                     }
                 }
             }
@@ -111,7 +114,7 @@ impl Recovery {
         let min_lsn_after = to_replay
             .first_key_value()
             .map(|(lsn, _)| *lsn)
-            .unwrap_or(0);
+            .unwrap_or(old_flush_lsn);
         if min_lsn_after > min_lsn_before {
             {
                 let mut running_state = tree_structure.running_state.write().await;
@@ -126,9 +129,7 @@ impl Recovery {
         let mut already_running = false;
         let mut to_replay: BTreeMap<usize, BTreeLogEntry> = BTreeMap::new();
         loop {
-            println!("Replaying from: {curr_start_lsn}");
             let entries = self.tree_structure.plog.replay(curr_start_lsn).await;
-            println!("Found entries: {}", entries.len());
             if entries.is_empty() {
                 break;
             }
@@ -524,7 +525,7 @@ impl Recovery {
         write_chs: Vec<oneshot::Receiver<()>>,
         shared_lock: Option<OwnedRwLockReadGuard<()>>,
     ) {
-        let in_sync = shared_lock.is_some();
+        let in_sync = shared_lock.is_none();
         let t = tokio::spawn(async move {
             let _shared_lock = shared_lock;
             for write_ch in write_chs {

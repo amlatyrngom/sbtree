@@ -217,6 +217,7 @@ impl BTreeStructure {
         } else {
             let leaf_version = leaf.version;
             leaf.insert(key.as_bytes().to_vec(), value.clone());
+            // println!("Leaf size: {}KB. IsFull={}", (leaf.total_size as f64) / 1024.0, leaf.is_full());
             // Log if not recovering.
             let lsn = match recovery {
                 Some((lsn, _)) => lsn,
@@ -305,7 +306,7 @@ impl BTreeStructure {
         key: &str,
     ) -> Result<(String, OwnedRwLockReadGuard<()>, usize), BTreeRespMeta> {
         let ownership = self.global_ownership.find_owner(key, true).await;
-        println!("Ownership key: {ownership:?}");
+        // println!("Ownership key: {ownership:?}");
         let ownership_key = match ownership {
             None => return Err(BTreeRespMeta::InvariantIssue), // There should always be an owner.
             Some((ownership_key, owner_id)) => {
@@ -336,8 +337,7 @@ impl BTreeStructure {
             Ok(lock) => lock,
             Err(_) => {
                 // There is an ongoing ownership change.
-                println!("Ownership Locked: {ownership:?}");
-                return Err(BTreeRespMeta::BadOwner);
+                return Err(BTreeRespMeta::Locked);
             }
         };
         Ok((ownership_key, shared_lock, ownership.len()))
@@ -357,9 +357,9 @@ impl BTreeStructure {
                     return;
                 }
             };
-            println!(
-                "BTreeStructure::split_or_merge_leaf(). Taking exclusive lock on {ownership_key}!"
-            );
+            // println!(
+            //     "BTreeStructure::split_or_merge_leaf(). Taking exclusive lock on {ownership_key}!"
+            // );
             let _exclusive_lock = ownership_lock.write_owned().await;
             let root_id = LocalOwnership::block_id_from_key(&ownership_key);
             let root = this
@@ -389,6 +389,7 @@ impl BTreeStructure {
                 }
             };
             if leaf.is_none() {
+                println!("Leaf to split does not exist anymore!");
                 this.block_cache.unpin(&root_id).await;
                 return;
             }
@@ -408,6 +409,7 @@ impl BTreeStructure {
                         .unwrap();
                     (from_leaf, from_leaf_id, from_leaf_key)
                 };
+                println!("Merging Leaf: {leaf_id}, {from_leaf_id}");
                 this.perform_leaf_merge(
                     &ownership_key,
                     root,
@@ -430,13 +432,25 @@ impl BTreeStructure {
     pub async fn lookup_root_and_leaf(&self, key: &str) -> Result<LookupResult, BTreeRespMeta> {
         // Lock ownership until end of query.
         // When inner node is full, will launch an async thread with exclusive lock.
-        let (ownership_key, shared_lock, num_ownerships) = match self.lock_owner_shared(key).await {
-            Ok(x) => x,
-            Err(resp) => {
-                println!("No Ownership.");
-                return Err(resp);
-            }
+        let (ownership_key, shared_lock, num_ownerships) = loop {
+            match self.lock_owner_shared(key).await {
+                Ok(x) => break x,
+                Err(resp) => {
+                    match resp {
+                        BTreeRespMeta::Locked => {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            continue;
+                        },
+                        _ => {
+                            println!("No Ownership.");
+                            return Err(resp);
+                        }
+                    }
+                }
+            };
         };
+        
+        
         // Find root.
         let root_id = LocalOwnership::block_id_from_key(&ownership_key);
         let root = self.block_cache.pin(&ownership_key, &root_id).await;
@@ -702,6 +716,7 @@ impl BTreeStructure {
             let mut from_leaf = from_leaf.write().await;
             // Do merge.
             leaf.merge(&mut from_leaf);
+            root.delete(from_leaf_key);
             // Log if not recovering.
             let lsn = match recovery {
                 Some(lsn) => lsn,

@@ -6,6 +6,8 @@ use aws_sdk_dynamodb::model::{
 use obelisk::MessagingClient;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
+use std::ops::Bound;
+
 
 /// Manages global ownership by workers though dynamodb.
 /// Global ownership keys are level-2 keys in the btree.
@@ -46,17 +48,12 @@ impl GlobalOwnership {
         };
         if let Some(owner_id) = owner_id {
             if owner_id == "manager" {
-                println!("GlobalOwnership::new(). Recovering manager1");
                 ownership.mark_owner_state("manager", false).await;
-                println!("GlobalOwnership::new(). Recovering manager2");
                 ownership.recover_worker_states().await;
-                println!("GlobalOwnership::new(). Recovering manager3");
                 ownership.recover_rescaling().await;
             }
         }
-        println!("GlobalOwnership::new(). Recovering manager4");
         ownership.refresh_ownership_keys().await;
-        println!("GlobalOwnership::new(). Recovering manager5");
         ownership
     }
 
@@ -519,16 +516,17 @@ impl GlobalOwnership {
         let key = format!("/okey/{key}");
         let owner_id = inner
             .ownership_keys
-            .range(key..)
-            .next()
+            .range((Bound::Unbounded, Bound::Included(key)))
+            .last()
             .map(|(k, v)| (k.clone(), v.clone()));
         if owner_id.is_some() {
             owner_id
         } else {
-            // Return last element if key is greater than everything.
+            // This should probably never happen since the default ownership key is the smallest possible key (empty key).
+            // But I am too lazy to put an unwrap() there.
             inner
                 .ownership_keys
-                .last_key_value()
+                .first_key_value()
                 .map(|(k, v)| (k.clone(), v.clone()))
         }
     }

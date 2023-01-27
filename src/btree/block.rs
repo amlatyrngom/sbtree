@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, RwLock};
+use std::ops::Bound;
 
-/// Leaves should be around ~128KB.
+
+/// Leaves should be around ~256KB.
 pub const TARGET_LEAF_SIZE: usize = 1 << 18;
 /// Inner nodes have around 1000 children.
 pub const TARGET_INNER_LENGTH: usize = 1000;
@@ -98,12 +100,25 @@ impl BlockCache {
 
     /// For testing only.
     #[cfg(test)]
-    pub async fn check_all_unpinned(&self, expected_unpinned_count: Option<usize>) {
+    pub async fn check_all_unpinned(&self, exact_unpinned_count: Option<usize>, min_unpinned_count: Option<usize>, max_unpinned_count: Option<usize>) {
         let inner = self.inner.lock().await;
         assert!(inner.pincounts.is_empty());
         assert!(inner.pinned.is_empty());
-        if let Some(c) = expected_unpinned_count {
+        if let Some(c) = exact_unpinned_count {
+            // println!("Checking {}=={c}", inner.unpinned.len());
             assert!(inner.unpinned.len() == c);
+            assert!(inner.unpinned_lru.len() == inner.unpinned.len());
+        }
+        if let Some(c) = min_unpinned_count {
+            // println!("Checking {}>={c}", inner.unpinned.len());
+            assert!(inner.unpinned.len() >= c);
+            // println!("Comparing unpins: {} and {}", inner.unpinned_lru.len(), inner.unpinned.len());
+            assert!(inner.unpinned_lru.len() == inner.unpinned.len());
+        }
+        if let Some(c) = max_unpinned_count {
+            // println!("Checking {}<={c}", inner.unpinned.len());
+            assert!(inner.unpinned.len() <= c);
+            // println!("Comparing unpins: {} and {}", inner.unpinned_lru.len(), inner.unpinned.len());
             assert!(inner.unpinned_lru.len() == inner.unpinned.len());
         }
     }
@@ -207,6 +222,7 @@ impl BlockCache {
                     }
                 },
                 Some(block_ref) => {
+                    inner.unpinned_lru.pop(block_id); // Also remove from lru.
                     let block_ref = match tree_block {
                         None => block_ref,
                         Some(tree_block) => Arc::new(RwLock::new(tree_block)),
@@ -419,7 +435,13 @@ impl BlockCache {
     /// write_back must have already been called.
     pub async fn unpin(&self, block_id: &str) {
         let mut inner = self.inner.lock().await;
-        let block = inner.pinned.get(block_id).unwrap().clone();
+        let block = match inner.pinned.get(block_id).cloned() {
+            Some(block) => block,
+            None => {
+                println!("Unpin wrong block: {block_id}");
+                std::process::exit(1);
+            }
+        };
         let pincount = inner.pincounts.get_mut(block_id).unwrap();
         *pincount -= 1;
         if *pincount == 0 {
@@ -478,15 +500,15 @@ impl TreeBlock {
         let key = key.to_vec();
         let kv = self
             .data
-            .range(key..)
-            .next()
+            .range((Bound::Unbounded, Bound::Included(key)))
+            .last()
             .map(|(k, v)| (k.clone(), v.clone()));
         if kv.is_some() {
             kv
         } else {
-            // Return last element if key is greater than everything.
+            // Just return first kv pair.
             self.data
-                .last_key_value()
+                .first_key_value()
                 .map(|(k, v)| (k.clone(), v.clone()))
         }
     }
