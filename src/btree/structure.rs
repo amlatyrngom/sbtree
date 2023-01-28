@@ -300,6 +300,54 @@ impl BTreeStructure {
         should_merge_leaf && !is_last_leaf
     }
 
+    /// Handle load kv logic common to normal operations and recovery.
+    pub async fn perform_load_kv(
+        &self,
+        ownership_key: &str,
+        key: &str,
+        value: Vec<u8>,
+        leaf: TreeBlockRef,
+        shared_lock: OwnedRwLockReadGuard<()>,
+    ) -> bool {
+        let mut leaf = leaf.write().await;
+        let mut write_chs = Vec::new();
+        // Insert without logging.
+        leaf.insert(key.as_bytes().to_vec(), value.clone());
+        let write_ch = self
+            .block_cache
+            .write_back(ownership_key, &mut leaf)
+            .await
+            .unwrap();
+        write_chs.push(write_ch);
+        // Write asynchronously.
+        Recovery::wait_for_writes(self.plog.clone(), 0, write_chs, Some(shared_lock)).await;
+        leaf.is_full()
+    }
+
+    /// Handle load kv logic common to normal operations and recovery.
+    pub async fn perform_unload_kv(
+        &self,
+        ownership_key: &str,
+        key: &str,
+        leaf: TreeBlockRef,
+        is_last_leaf: bool,
+        shared_lock: OwnedRwLockReadGuard<()>,
+    ) -> bool {
+        let mut leaf = leaf.write().await;
+        let mut write_chs = Vec::new();
+        // Insert without logging.
+        leaf.delete(key.as_bytes());
+        let write_ch = self
+            .block_cache
+            .write_back(ownership_key, &mut leaf)
+            .await
+            .unwrap();
+        write_chs.push(write_ch);
+        // Write asynchronously.
+        Recovery::wait_for_writes(self.plog.clone(), 0, write_chs, Some(shared_lock)).await;
+        leaf.is_half_empty() && !is_last_leaf
+    }
+
     /// Lock ownership shared.
     async fn lock_owner_shared(
         &self,
@@ -322,22 +370,20 @@ impl BTreeStructure {
             }
         };
         // Block ownership changes while this query is processing.
-        // Likewise, if an ownership change is ongoing, this will return BadOwner.
         let ownership = self.ownership.read().await;
         if !ownership.contains_key(&ownership_key) {
-            println!("Ownership: {ownership:?}");
             let this = self.clone();
             tokio::spawn(async move {
                 this.fetch_new_ownership().await;
             });
-            return Err(BTreeRespMeta::BadOwner);
+            return Err(BTreeRespMeta::LockConflict);
         }
         let lock = ownership.get(&ownership_key).cloned().unwrap();
         let shared_lock = match lock.try_read_owned() {
             Ok(lock) => lock,
             Err(_) => {
                 // There is an ongoing ownership change.
-                return Err(BTreeRespMeta::Locked);
+                return Err(BTreeRespMeta::LockConflict);
             }
         };
         Ok((ownership_key, shared_lock, ownership.len()))
@@ -362,11 +408,11 @@ impl BTreeStructure {
             // );
             let _exclusive_lock = ownership_lock.write_owned().await;
             let root_id = LocalOwnership::block_id_from_key(&ownership_key);
-            let root = this
-                .block_cache
-                .pin(&ownership_key, &root_id)
-                .await
-                .unwrap();
+            let root = this.block_cache.pin(&ownership_key, &root_id).await;
+            if root.is_none() {
+                return;
+            }
+            let root = root.unwrap();
             let leaf = {
                 let root = root.read().await;
                 if root.data.contains_key(&leaf_key) {
@@ -389,7 +435,6 @@ impl BTreeStructure {
                 }
             };
             if leaf.is_none() {
-                println!("Leaf to split does not exist anymore!");
                 this.block_cache.unpin(&root_id).await;
                 return;
             }
@@ -409,7 +454,6 @@ impl BTreeStructure {
                         .unwrap();
                     (from_leaf, from_leaf_id, from_leaf_key)
                 };
-                println!("Merging Leaf: {leaf_id}, {from_leaf_id}");
                 this.perform_leaf_merge(
                     &ownership_key,
                     root,
@@ -435,22 +479,19 @@ impl BTreeStructure {
         let (ownership_key, shared_lock, num_ownerships) = loop {
             match self.lock_owner_shared(key).await {
                 Ok(x) => break x,
-                Err(resp) => {
-                    match resp {
-                        BTreeRespMeta::Locked => {
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                            continue;
-                        },
-                        _ => {
-                            println!("No Ownership.");
-                            return Err(resp);
-                        }
+                Err(resp) => match resp {
+                    BTreeRespMeta::LockConflict => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        continue;
                     }
-                }
+                    _ => {
+                        println!("No Ownership.");
+                        return Err(resp);
+                    }
+                },
             };
         };
-        
-        
+
         // Find root.
         let root_id = LocalOwnership::block_id_from_key(&ownership_key);
         let root = self.block_cache.pin(&ownership_key, &root_id).await;
@@ -556,15 +597,14 @@ impl BTreeStructure {
                     return;
                 }
             };
-            println!("BTreeStructure::split_or_merge_ownership(). Taking exclusive lock on {ownership_key}!");
             let _ownership_lock = ownership_lock.write_owned().await;
             // Check if should merge or split.
             let root_id = LocalOwnership::block_id_from_key(&ownership_key);
-            let root = this
-                .block_cache
-                .pin(&ownership_key, &root_id)
-                .await
-                .unwrap();
+            let root = this.block_cache.pin(&ownership_key, &root_id).await;
+            if root.is_none() {
+                return;
+            }
+            let root = root.unwrap();
             let (full, empty) = {
                 let root = root.read().await;
                 (root.is_full(), root.is_half_empty())
@@ -584,6 +624,7 @@ impl BTreeStructure {
                         other_exclusive_lock,
                     } = this.find_adjacent_root(root.clone(), &ownership_key).await;
                     let _other_exclusive_lock = other_exclusive_lock;
+                    println!("Merging {from_ownership_key} into {to_ownership_key}");
                     this.perform_root_merge(
                         Some(from_root),
                         &from_ownership_key,
@@ -901,20 +942,24 @@ impl BTreeStructure {
             from_root.version += 1;
             let delete_ch = self
                 .block_cache
-                .write_back(from_ownership_key, &mut from_root);
+                .write_back(from_ownership_key, &mut from_root)
+                .await
+                .unwrap();
             delete_ch.await.unwrap();
         }
         // Delete ownership.
+        {
+            let mut ownership = self.ownership.write().await;
+            ownership.remove(from_ownership_key);
+        }
+        println!("Delete root ownership after merge: {from_ownership_key:?}");
         self.block_cache
             .remove_ownership_key(from_ownership_key, true)
             .await;
         self.global_ownership
             .remove_ownership_key(&self.owner_id, from_ownership_key)
             .await;
-        {
-            let mut ownership = self.ownership.write().await;
-            ownership.remove(from_ownership_key);
-        }
+
         // Synchronously write completion record now that all operations are done.
         Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
     }
@@ -938,11 +983,19 @@ impl BTreeStructure {
                 (next_ownership_key, next_root_lock, true)
             }
             None => {
+                println!("Reverse merging!!!!!!!");
                 let ownership = self.ownership.read().await;
                 let ownership_key = ownership_key.to_string();
                 let mut range = ownership.range(..ownership_key);
-                range.next_back();
-                let (other_ownership_key, other_root_lock) = range.next_back().unwrap();
+                // Range ..key is exclusive of key, so one call to next_back suffices.
+                let (other_ownership_key, other_root_lock) = match range.next_back() {
+                    Some(x) => x,
+                    None => {
+                        // TODO: Just replace with next_back().unwrap() when done debugging.
+                        println!("Bad ownerships: {:?}", ownership.keys());
+                        std::process::exit(1);
+                    }
+                };
                 (other_ownership_key.clone(), other_root_lock.clone(), false)
             }
         };
@@ -954,7 +1007,7 @@ impl BTreeStructure {
             .pin(&other_ownership_key, &other_root_id)
             .await
             .unwrap();
-        if is_after {
+        if !is_after {
             RootAdjacencyResult {
                 from_root: root,
                 from_ownership_key: ownership_key.into(),

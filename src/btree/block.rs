@@ -1,15 +1,14 @@
 use super::local_ownership::LocalOwnership;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, RwLock};
-use std::ops::Bound;
 
-
-/// Leaves should be around ~256KB.
+/// Leaves size (Ideally 256KB, meaning an avg size of 200KB).
 pub const TARGET_LEAF_SIZE: usize = 1 << 18;
-/// Inner nodes have around 1000 children.
-pub const TARGET_INNER_LENGTH: usize = 1000;
+/// Number of inner node children. Ideally scaling unit size should be 32MB-64MB, with ~50MB the average.
+pub const TARGET_INNER_LENGTH: usize = 256;
 /// Reference to a block
 pub type TreeBlockRef = Arc<RwLock<TreeBlock>>;
 
@@ -59,7 +58,8 @@ struct BlockCacheStats {
 /// Marks ongoing transfers.
 struct Transfer {
     ongoing_reads: HashSet<String>,
-    ongoing_writes: HashMap<String, VecDeque<usize>>,
+    ongoing_writes: HashSet<String>,
+    ongoing_writes_queue: HashMap<String, VecDeque<usize>>,
 }
 
 impl BlockCache {
@@ -68,7 +68,8 @@ impl BlockCache {
         // Transfer.
         let transfer = Arc::new(Mutex::new(Transfer {
             ongoing_reads: HashSet::new(),
-            ongoing_writes: HashMap::new(),
+            ongoing_writes: HashSet::new(),
+            ongoing_writes_queue: HashMap::new(),
         }));
         let total_mem = std::env::var("MEMORY").unwrap_or_else(|_| "1".into());
         let total_mem: usize = total_mem.parse().unwrap();
@@ -100,7 +101,12 @@ impl BlockCache {
 
     /// For testing only.
     #[cfg(test)]
-    pub async fn check_all_unpinned(&self, exact_unpinned_count: Option<usize>, min_unpinned_count: Option<usize>, max_unpinned_count: Option<usize>) {
+    pub async fn check_all_unpinned(
+        &self,
+        exact_unpinned_count: Option<usize>,
+        min_unpinned_count: Option<usize>,
+        max_unpinned_count: Option<usize>,
+    ) {
         let inner = self.inner.lock().await;
         assert!(inner.pincounts.is_empty());
         assert!(inner.pinned.is_empty());
@@ -148,6 +154,7 @@ impl BlockCache {
             local_ownership.remove(ownership_key)
         };
         if delete {
+            println!("Deleting ownership: {ownership_key}");
             if let Some(db) = db {
                 db.delete().await;
             }
@@ -268,7 +275,7 @@ impl BlockCache {
         // Initiate transfer if none ongoing.
         {
             let mut transfer = self.transfer.lock().await;
-            if transfer.ongoing_writes.contains_key(block_id) {
+            if transfer.ongoing_writes_queue.contains_key(block_id) {
                 return (None, true);
             }
             if transfer.ongoing_reads.contains(block_id) {
@@ -339,17 +346,32 @@ impl BlockCache {
     /// Push new version to back of the write queue.
     /// This is to guarantee in-order writes.
     async fn initiate_write(transfer: Arc<Mutex<Transfer>>, tree_block: &mut TreeBlock) -> usize {
-        let mut transfer = transfer.lock().await;
-        if !transfer.ongoing_writes.contains_key(&tree_block.block_id) {
+        loop {
+            let mut transfer = transfer.lock().await;
+            if !transfer
+                .ongoing_writes_queue
+                .contains_key(&tree_block.block_id)
+            {
+                transfer
+                    .ongoing_writes_queue
+                    .insert(tree_block.block_id.clone(), VecDeque::new());
+            }
+            let queue = transfer
+                .ongoing_writes_queue
+                .get_mut(&tree_block.block_id)
+                .unwrap();
+            if queue.len() > 50 {
+                // Just a moderate magic number.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                continue;
+            }
             transfer
-                .ongoing_writes
-                .insert(tree_block.block_id.clone(), VecDeque::new());
+                .ongoing_writes_queue
+                .get_mut(&tree_block.block_id)
+                .unwrap()
+                .push_back(tree_block.version);
+            break;
         }
-        transfer
-            .ongoing_writes
-            .get_mut(&tree_block.block_id)
-            .unwrap()
-            .push_back(tree_block.version);
         tree_block.version
     }
 
@@ -358,12 +380,31 @@ impl BlockCache {
         transfer: Arc<Mutex<Transfer>>,
         block_id: &str,
         write_version: usize,
-    ) {
+    ) -> bool {
         loop {
             {
-                let transfer = transfer.lock().await;
-                if transfer.ongoing_writes.get(block_id).unwrap()[0] == write_version {
-                    break;
+                let mut transfer = transfer.lock().await;
+                let has_other_ongoing_write = transfer.ongoing_writes.contains(block_id);
+                let (was_written, can_write_next) = {
+                    let queue = transfer.ongoing_writes_queue.get(block_id);
+                    match queue {
+                        None => (true, false),
+                        Some(queue) => {
+                            let earliest_write = *queue.front().unwrap();
+                            let latest_write = *queue.back().unwrap();
+                            (
+                                earliest_write > write_version,
+                                latest_write == write_version,
+                            )
+                        }
+                    }
+                };
+                if was_written {
+                    return false;
+                }
+                if can_write_next && !has_other_ongoing_write {
+                    transfer.ongoing_writes.insert(block_id.into());
+                    return true;
                 }
             }
             // Hacky. Should use condition variables.
@@ -372,12 +413,24 @@ impl BlockCache {
     }
 
     /// Remove new version from front of queue and delete queue if empty (to signal that reads can proceed).
-    async fn finish_write_back(transfer: Arc<Mutex<Transfer>>, block_id: &str) {
+    async fn finish_write_back(
+        transfer: Arc<Mutex<Transfer>>,
+        block_id: &str,
+        write_version: usize,
+    ) {
         let mut transfer = transfer.lock().await;
-        let writes = transfer.ongoing_writes.get_mut(block_id).unwrap();
-        writes.pop_front();
-        if writes.is_empty() {
-            transfer.ongoing_writes.remove(block_id);
+        let deleted = transfer.ongoing_writes.remove(block_id);
+        assert!(deleted);
+        let queue = transfer.ongoing_writes_queue.get_mut(block_id).unwrap();
+        while !queue.is_empty() {
+            if queue[0] <= write_version {
+                queue.pop_front();
+            } else {
+                break;
+            }
+        }
+        if queue.is_empty() {
+            transfer.ongoing_writes_queue.remove(block_id);
         }
     }
 
@@ -406,25 +459,41 @@ impl BlockCache {
         if tree_block.deleted {
             tokio::spawn(async move {
                 // Wait for version to come in front of queue.
-                Self::wait_for_write_turn(transfer.clone(), &block_id, write_version).await;
-                // Delete.
-                db.delete_block(&block_id).await;
-                // Delete version from queue.
-                Self::finish_write_back(transfer, &block_id).await;
+                // if block_id.starts_with("L29r") {
+                //     println!("Received root delete write_back: {block_id}");
+                // }
+                let can_write =
+                    Self::wait_for_write_turn(transfer.clone(), &block_id, write_version).await;
+                if can_write {
+                    // Delete.
+                    db.delete_block(&block_id).await;
+                    // Delete version from queue.
+                    Self::finish_write_back(transfer, &block_id, write_version).await;
+                    // if block_id.starts_with("L29r") {
+                    //     println!("Completed root delete write_back: {block_id}");
+                    // }
+                }
+                // if block_id.starts_with("L29r") {
+                //     println!("Responding to root delete write_back: {block_id}");
+                // }
                 write_tx.send(()).unwrap();
             });
         } else {
             let tree_block = tree_block.clone();
             tokio::spawn(async move {
-                // Serialize.
-                let data =
-                    tokio::task::block_in_place(move || bincode::serialize(&tree_block).unwrap());
                 // Wait for write turn.
-                Self::wait_for_write_turn(transfer.clone(), &block_id, write_version).await;
-                // Write.
-                db.write_block(&block_id, data).await;
-                // Delete version from queue.
-                Self::finish_write_back(transfer, &block_id).await;
+                let can_write =
+                    Self::wait_for_write_turn(transfer.clone(), &block_id, write_version).await;
+                if can_write {
+                    // Serialize.
+                    let data = tokio::task::block_in_place(move || {
+                        bincode::serialize(&tree_block).unwrap()
+                    });
+                    // Write.
+                    db.write_block(&block_id, data).await;
+                    // Delete version from queue.
+                    Self::finish_write_back(transfer, &block_id, write_version).await;
+                }
                 write_tx.send(()).unwrap();
             });
         }
@@ -489,9 +558,9 @@ impl TreeBlock {
     /// Check if block is half empty.
     pub fn is_half_empty(&self) -> bool {
         if self.height == 0 {
-            self.total_size < TARGET_LEAF_SIZE / 2
+            self.total_size < TARGET_LEAF_SIZE / 2 - 1
         } else {
-            self.data.len() < TARGET_INNER_LENGTH / 2
+            self.data.len() < TARGET_INNER_LENGTH / 2 - 1
         }
     }
 
@@ -582,7 +651,8 @@ impl TreeBlock {
         self.dirty = true;
         // Create and fill new block.
         let mut new_block = TreeBlock::new(&new_block_id, self.height);
-        while new_block.is_half_empty() {
+        let num_to_move = self.data.len() / 2;
+        for _ in 0..num_to_move {
             let kv = self.data.pop_last();
             if let Some((key, value)) = kv {
                 self.total_size -= key.len() + value.len();
@@ -688,10 +758,10 @@ mod tests {
         {
             let child1 = child1_ref.read().await;
             let child3 = child3_ref.read().await;
-            assert!(!child1.data.contains_key(&b"Amadou1".to_vec()));
-            assert!(child1.data.contains_key(&b"Amadou2".to_vec()));
-            assert!(child3.data.contains_key(&b"Amadou1".to_vec()));
-            assert!(!child3.data.contains_key(&b"Amadou2".to_vec()));
+            assert!(child1.data.contains_key(&b"Amadou1".to_vec()));
+            assert!(!child1.data.contains_key(&b"Amadou2".to_vec()));
+            assert!(!child3.data.contains_key(&b"Amadou1".to_vec()));
+            assert!(child3.data.contains_key(&b"Amadou2".to_vec()));
         }
     }
 
@@ -770,6 +840,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn write_back_test() {
+        run_write_back_test().await;
+    }
+
+    async fn run_write_back_test() {
+        let bc = Arc::new(BlockCache::new().await);
+        println!("Creating Blocks");
+        {
+            let block = TreeBlock::new("block", 0);
+            let create_ch = bc.create("foo", block).await;
+            create_ch.await.unwrap();
+        }
+        let mut write_chs = Vec::new();
+        let mut expected = BTreeMap::new();
+        for i in 0..100 {
+            let block = bc.pin("foo", "block").await.unwrap();
+            let write_ch = {
+                let mut block = block.write().await;
+                let key: usize = i % 10;
+                let val: usize = i;
+                block.insert(key.to_be_bytes().to_vec(), val.to_be_bytes().to_vec());
+                expected.insert(key.to_be_bytes().to_vec(), val.to_be_bytes().to_vec());
+                bc.write_back("foo", &mut block).await.unwrap()
+            };
+            write_chs.push(write_ch);
+            bc.unpin("block").await;
+        }
+        for write_ch in write_chs {
+            write_ch.await.unwrap();
+        }
+        // Check on disk content.
+        let bc = Arc::new(BlockCache::new().await);
+        let block = bc.pin("foo", "block").await.unwrap();
+        {
+            let block = block.read().await;
+            assert_eq!(expected, block.data)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn bench_test() {
         run_bench_test().await;
     }
@@ -820,7 +930,6 @@ mod tests {
     fn bincode_bench() {
         let mut data: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         // Entry is a little over 1KB (128B keys, 1KB values).
-        // Data is ~1MB.
         let num_entries = super::TARGET_LEAF_SIZE / (1024 + 128);
         println!("Num entries: {num_entries}");
         for i in 0..num_entries {

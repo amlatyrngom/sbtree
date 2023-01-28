@@ -54,15 +54,15 @@ impl LocalOwnership {
             let mut conn = match self.pool.get() {
                 Ok(conn) => conn,
                 Err(x) => {
-                    println!("{x:?}");
-                    continue;
+                    println!("DeleteBlock({block_id}, conn): {x:?}");
+                    std::process::exit(1);
                 }
             };
             let txn = match conn.transaction() {
                 Ok(txn) => txn,
                 Err(x) => {
-                    println!("{x:?}");
-                    continue;
+                    println!("DeleteBlock({block_id}, txn): {x:?}");
+                    std::process::exit(1);
                 }
             };
             let incarn_num = txn.query_row("SELECT incarnation_num FROM incarnation", [], |row| {
@@ -70,8 +70,8 @@ impl LocalOwnership {
             });
             match incarn_num {
                 Err(x) => {
-                    println!("{x:?}");
-                    continue;
+                    println!("DeleteBlock({block_id}, incarn): {x:?}");
+                    std::process::exit(1);
                 }
                 Ok(incarn_num) => {
                     let incarn_num: usize = incarn_num;
@@ -85,15 +85,15 @@ impl LocalOwnership {
             let resp = txn.execute("DELETE FROM blocks WHERE block_id = ?", [block_id]);
             match resp {
                 Err(x) => {
-                    println!("{x:?}");
-                    continue;
+                    println!("DeleteBlock({block_id}, exec): {x:?}");
+                    std::process::exit(1);
                 }
                 Ok(_executed) => {}
             }
             match txn.commit() {
                 Err(x) => {
-                    println!("{x:?}");
-                    continue;
+                    println!("DeleteBlock({block_id}, commit): {x:?}");
+                    std::process::exit(1);
                 }
                 Ok(_) => return,
             }
@@ -106,8 +106,8 @@ impl LocalOwnership {
             let conn = match self.pool.get() {
                 Ok(conn) => conn,
                 Err(x) => {
-                    println!("{x:?}");
-                    continue;
+                    println!("WriteBlock({block_id}, conn): {x:?}");
+                    std::process::exit(1);
                 }
             };
             let executed = conn.execute(
@@ -124,8 +124,8 @@ impl LocalOwnership {
                     return;
                 }
                 Err(x) => {
-                    println!("{x:?}");
-                    continue;
+                    println!("WriteBlock({block_id}): {x:?}");
+                    std::process::exit(1);
                 }
             }
         })
@@ -133,8 +133,8 @@ impl LocalOwnership {
 
     /// Move from source to destination.
     pub async fn move_blocks(&self, to: &Self, block_ids: Vec<String>) {
-        // Split block_ids into chunks (100 corresponds to ~1MB).
-        let chunks: Vec<&[String]> = block_ids.chunks(100).collect();
+        // Split block_ids into chunks.
+        let chunks: Vec<&[String]> = block_ids.chunks(64).collect();
         for chunk in chunks {
             // from: SELECT block_id, data FROM blocks WHERE block_id IN (chunk ids).
             // to: INSERT INTO blocks(block_id, data) VALUES (chunk ids, chunk data).
@@ -149,14 +149,14 @@ impl LocalOwnership {
                 let conn = match self.pool.get() {
                     Ok(conn) => conn,
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                 };
                 let mut select_stmt = match conn.prepare(&select_stmt) {
                     Ok(select_stmt) => select_stmt,
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                 };
@@ -168,7 +168,7 @@ impl LocalOwnership {
                 let block_iter = match block_iter {
                     Ok(block_iter) => block_iter,
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                 };
@@ -195,14 +195,14 @@ impl LocalOwnership {
                 let mut conn = match to.pool.get() {
                     Ok(conn) => conn,
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                 };
                 let txn = match conn.transaction() {
                     Ok(txn) => txn,
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                 };
@@ -212,7 +212,7 @@ impl LocalOwnership {
                     });
                 match incarn_num {
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                     Ok(incarn_num) => {
@@ -227,14 +227,14 @@ impl LocalOwnership {
                 let resp = txn.execute(&insert_stmt, insert_params.clone());
                 match resp {
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                     Ok(_executed) => {}
                 }
                 match txn.commit() {
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                     Ok(_) => break,
@@ -245,14 +245,14 @@ impl LocalOwnership {
                 let mut conn = match self.pool.get() {
                     Ok(conn) => conn,
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                 };
                 let txn = match conn.transaction() {
                     Ok(txn) => txn,
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                 };
@@ -262,7 +262,7 @@ impl LocalOwnership {
                     });
                 match incarn_num {
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                     Ok(incarn_num) => {
@@ -277,14 +277,14 @@ impl LocalOwnership {
                 let resp = txn.execute(&delete_stmt, in_params.clone());
                 match resp {
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                     Ok(_executed) => {}
                 }
                 match txn.commit() {
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("MoveBlocks: {x:?}");
                         continue;
                     }
                     Ok(_) => break,
@@ -333,28 +333,28 @@ impl LocalOwnership {
             let pool = match r2d2::Pool::builder().max_size(1).build(manager) {
                 Ok(pool) => pool,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("NewLocalOwnership: {x:?}");
                     continue;
                 }
             };
             let mut conn = match pool.get() {
                 Ok(conn) => conn,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("NewLocalOwnership: {x:?}");
                     continue;
                 }
             };
             let txn = match conn.transaction() {
                 Ok(txn) => txn,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("NewLocalOwnership: {x:?}");
                     continue;
                 }
             };
             match txn.execute("CREATE TABLE IF NOT EXISTS incarnation (unique_row INTEGER PRIMARY KEY, incarnation_num INT)", ()) {
                 Ok(_) => {},
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("NewLocalOwnership: {x:?}");
                     continue;
                 }
             }
@@ -364,7 +364,7 @@ impl LocalOwnership {
             ) {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("NewLocalOwnership: {x:?}");
                     continue;
                 }
             }
@@ -377,7 +377,7 @@ impl LocalOwnership {
             ) {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("NewLocalOwnership: {x:?}");
                     continue;
                 }
             };

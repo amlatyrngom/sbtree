@@ -28,7 +28,7 @@ pub enum BTreeRespMeta {
     NotFound,
     Ok,
     BadOwner,
-    Locked,
+    LockConflict,
     InvariantIssue,
 }
 
@@ -233,7 +233,7 @@ impl BTreeActor {
                         tree_structure.global_ownership.update_load(load).await;
                     } else {
                         tree_structure.global_ownership.remove_load().await;
-                    }    
+                    }
                 });
             }
         }
@@ -249,6 +249,70 @@ impl BTreeActor {
         self.tree_structure
             .perform_rescaling(&rescaling_uid, &to, remove_self, None)
             .await;
+        (BTreeRespMeta::Ok, vec![])
+    }
+
+    /// Will bypass logging. Used only to load data for tests.
+    pub async fn load_kv(&self, key: &str, value: Vec<u8>) -> (BTreeRespMeta, Vec<u8>) {
+        // Lookup ownership, root, and leaf information.
+        let lookup_res = match self.tree_structure.lookup_root_and_leaf(key).await {
+            Ok(x) => x,
+            Err(resp) => return (resp, vec![]),
+        };
+        let LookupResult {
+            ownership_key,
+            root: _,
+            leaf,
+            root_id,
+            leaf_id,
+            split_key,
+            is_last_leaf: _,
+            shared_lock,
+        } = lookup_res;
+        let should_try_split = self
+            .tree_structure
+            .perform_load_kv(&ownership_key, key, value, leaf, shared_lock)
+            .await;
+        if should_try_split {
+            self.tree_structure
+                .split_or_merge_leaf(&ownership_key, &split_key)
+                .await;
+        }
+        // Unpin.
+        self.tree_structure.block_cache.unpin(&root_id).await;
+        self.tree_structure.block_cache.unpin(&leaf_id).await;
+        (BTreeRespMeta::Ok, vec![])
+    }
+
+    /// Will bypass logging. Used only to delete data for tests.
+    pub async fn unload_kv(&self, key: &str) -> (BTreeRespMeta, Vec<u8>) {
+        // Lookup ownership, root, and leaf information.
+        let lookup_res = match self.tree_structure.lookup_root_and_leaf(key).await {
+            Ok(x) => x,
+            Err(resp) => return (resp, vec![]),
+        };
+        let LookupResult {
+            ownership_key,
+            root: _,
+            leaf,
+            root_id,
+            leaf_id,
+            split_key,
+            is_last_leaf,
+            shared_lock,
+        } = lookup_res;
+        let should_try_split = self
+            .tree_structure
+            .perform_unload_kv(&ownership_key, key, leaf, is_last_leaf, shared_lock)
+            .await;
+        if should_try_split {
+            self.tree_structure
+                .split_or_merge_leaf(&ownership_key, &split_key)
+                .await;
+        }
+        // Unpin.
+        self.tree_structure.block_cache.unpin(&root_id).await;
+        self.tree_structure.block_cache.unpin(&leaf_id).await;
         (BTreeRespMeta::Ok, vec![])
     }
 

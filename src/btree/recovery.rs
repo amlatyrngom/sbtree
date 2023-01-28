@@ -531,8 +531,10 @@ impl Recovery {
             for write_ch in write_chs {
                 write_ch.await.unwrap();
             }
-            let completion_entry = BTreeLogEntry::Completion { lsn };
-            Self::write_log_entry(plog, completion_entry).await;
+            if lsn > 0 {
+                let completion_entry = BTreeLogEntry::Completion { lsn };
+                Self::write_log_entry(plog, completion_entry).await;
+            }
         });
         if in_sync {
             t.await.unwrap();

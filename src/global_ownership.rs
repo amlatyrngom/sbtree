@@ -5,9 +5,8 @@ use aws_sdk_dynamodb::model::{
 };
 use obelisk::MessagingClient;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
 use std::ops::Bound;
-
+use std::sync::{Arc, RwLock};
 
 /// Manages global ownership by workers though dynamodb.
 /// Global ownership keys are level-2 keys in the btree.
