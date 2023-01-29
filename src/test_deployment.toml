@@ -2,5 +2,5 @@ namespace = "sbtree"
 
 [messaging]
 path = "sbtree::BTreeActor"
-mem_size = 4096
+mem_size = 1024
 timeout = 5

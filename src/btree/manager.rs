@@ -24,7 +24,10 @@ impl BTreeManager {
     }
 
     /// Perform rescaling.
-    async fn manage_rescaling(&self, rescaling_op: RescalingOp) {
+    pub async fn manage_rescaling(&self, rescaling_op: RescalingOp, recovering: bool) {
+        self.global_ownership
+            .start_rescaling(rescaling_op.clone(), recovering)
+            .await;
         let (from, to) = match &rescaling_op {
             RescalingOp::ScaleIn { from, to, uid: _ } => (from, to),
             RescalingOp::ScaleOut { from, to, uid: _ } => (from, to),
@@ -47,24 +50,22 @@ impl BTreeManager {
                 break;
             }
         }
+        self.global_ownership.finish_rescaling().await;
     }
 
-    /// Perform management tasks.
-    pub async fn manage(&self) {
-        // Check external access and leasing.
-        if !obelisk::common::has_external_access() {
-            return;
-        }
+    /// Prevent concurrent rescaling.
+    pub async fn lock_manager(&self) -> bool {
         // Renew lease.
+        println!("Trying to renew lease");
         let acquired = self.leaser.renew("sbtree_management_leasing", false).await;
         if !acquired {
-            return;
+            return false;
         }
         // Only allow one management task at a time.
         {
             let mut managing = self.managing.lock().unwrap();
             if *managing {
-                return;
+                return false;
             } else {
                 *managing = true;
             }
@@ -78,13 +79,35 @@ impl BTreeManager {
                 leaser.renew("sbtree_management_leasing", false).await;
             }
         });
+        true
+    }
+
+    /// Unlock.
+    pub async fn unlock_manager(&self) {
+        let mut managing = self.managing.lock().unwrap();
+        *managing = false;
+    }
+
+    /// Perform management tasks.
+    pub async fn manage(&self) {
+        // Check external access and leasing.
+        if !obelisk::common::has_external_access() {
+            return;
+        }
+        if !self.global_ownership.can_do_regular_rescaling().await {
+            return;
+        }
+        // Prevent concurrent ops.
+        let locked = self.lock_manager().await;
+        if !locked {
+            return;
+        }
         // If there is an ongoing rescaling, perform it.
         let rescaling_op = self.global_ownership.get_ongoing_rescaling();
         match rescaling_op {
             None => {}
             Some(rescaling_op) => {
-                self.manage_rescaling(rescaling_op).await;
-                self.global_ownership.finish_rescaling().await;
+                self.manage_rescaling(rescaling_op, true).await;
             }
         }
         // Read loads.
@@ -118,8 +141,7 @@ impl BTreeManager {
                         .start_rescaling(rescaling_op.clone(), false)
                         .await;
                     if valid {
-                        self.manage_rescaling(rescaling_op).await;
-                        self.global_ownership.finish_rescaling().await;
+                        self.manage_rescaling(rescaling_op, false).await;
                     }
                 }
             }
@@ -150,18 +172,14 @@ impl BTreeManager {
                                 .start_rescaling(rescaling_op.clone(), false)
                                 .await;
                             if valid {
-                                self.manage_rescaling(rescaling_op).await;
-                                self.global_ownership.finish_rescaling().await;
+                                self.manage_rescaling(rescaling_op, false).await;
                             }
                         }
                     }
                 }
             }
         }
-        {
-            // Only allow one management task at a time.
-            let mut managing = self.managing.lock().unwrap();
-            *managing = false;
-        }
+        // Allow next operation to proceed.
+        self.unlock_manager().await;
     }
 }

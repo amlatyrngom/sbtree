@@ -120,7 +120,7 @@ impl Recovery {
                 let mut running_state = tree_structure.running_state.write().await;
                 running_state.checkpoint().await;
             }
-            tree_structure.plog.truncate(min_lsn_after).await;
+            tree_structure.plog.truncate(min_lsn_after - 1).await;
         }
     }
 
@@ -257,9 +257,17 @@ impl Recovery {
                     )
                     .await;
                 }
+                BTreeLogEntry::DeleteAll => {
+                    self.recover_delete_all(lsn).await;
+                }
             }
         }
         (self.tree_structure, already_running)
+    }
+
+    async fn recover_delete_all(&mut self, lsn: usize) {
+        let _recovery_exclusive = self.recovery_lock.clone().write_owned().await;
+        self.tree_structure.delete_all(Some(lsn)).await;
     }
 
     /// Recover rescaling.

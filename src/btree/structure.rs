@@ -114,8 +114,8 @@ impl BTreeStructure {
         }
         // If target of ownership change, mark self as active.
         if to_owner == self.owner_id {
-            self.block_cache.reset_load().await;
-            self.global_ownership.update_load(1.0).await;
+            let new_load = self.block_cache.reset_load().await;
+            self.global_ownership.update_load(new_load).await;
             let this = self.clone();
             tokio::spawn(async move {
                 // Must do this async to avoid deadlock.
@@ -983,7 +983,6 @@ impl BTreeStructure {
                 (next_ownership_key, next_root_lock, true)
             }
             None => {
-                println!("Reverse merging!!!!!!!");
                 let ownership = self.ownership.read().await;
                 let ownership_key = ownership_key.to_string();
                 let mut range = ownership.range(..ownership_key);
@@ -1024,5 +1023,52 @@ impl BTreeStructure {
                 other_exclusive_lock: other_root_lock,
             }
         }
+    }
+
+    /// TODO next: Implement delete all.
+    pub async fn delete_all(&self, recovery: Option<usize>) {
+        // Take all locks to block prevent concurrent operations.
+        let _ownership_change_lock = self.ownership_change_lock.write().await;
+        let ownership = {
+            let ownership = self.ownership.write().await;
+            ownership.clone()
+        };
+        let mut locks = Vec::new();
+        let mut ownership_keys = Vec::new();
+        for (ownership_key, lock) in ownership {
+            locks.push(lock.write_owned().await);
+            ownership_keys.push(ownership_key);
+        }
+        // Log for recovery.
+        let lsn = match recovery {
+            Some(lsn) => lsn,
+            None => {
+                let log_entry = BTreeLogEntry::DeleteAll;
+                Recovery::write_log_entry(self.plog.clone(), log_entry).await
+            }
+        };
+        // Remove all ownerships.
+        for ownership_key in &ownership_keys {
+            self.block_cache
+                .remove_ownership_key(ownership_key, true)
+                .await;
+            self.global_ownership
+                .remove_ownership_key(&self.owner_id, ownership_key)
+                .await;
+            let mut ownership = self.ownership.write().await;
+            ownership.remove(ownership_key);
+        }
+        // Truncate log up to DeleteAll entry.
+        self.plog.truncate(lsn - 1).await;
+        // Reinitialize.
+        self.initialize().await;
+        let new_running_state = RunningState::new(self.plog.clone(), true, 1, "");
+        {
+            let mut curr_running_state = self.running_state.write().await;
+            *curr_running_state = new_running_state;
+            curr_running_state.checkpoint().await;
+        }
+        Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
+        self.global_ownership.allow_regular_rescaling().await;
     }
 }

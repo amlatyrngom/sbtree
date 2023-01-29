@@ -125,10 +125,12 @@ impl GlobalOwnership {
                         if is_free {
                             inner.free_owners.insert(worker_id.clone());
                         }
-                        let this = self.clone();
-                        tokio::spawn(async move {
-                            let _mc = this.get_or_make_client(&worker_id).await;
-                        });
+                        if obelisk::common::has_external_access() {
+                            let this = self.clone();
+                            tokio::spawn(async move {
+                                let _mc = this.get_or_make_client(&worker_id).await;
+                            });
+                        }
                     }
                     return;
                 }
@@ -168,6 +170,75 @@ impl GlobalOwnership {
             inner.free_owners.insert(owner_id.into());
         } else {
             inner.free_owners.remove(owner_id);
+        }
+    }
+
+    /// Prevent regular rescaling.
+    pub async fn prevent_regular_rescaling(&self) {
+        loop {
+            let resp = self
+                .dynamo_client
+                .put_item()
+                .table_name("sbtree_rescaling")
+                .item("entry_type", AttributeValue::S("cleanup".into()))
+                .item("owner_id", AttributeValue::S("manager".into()))
+                .item("entry_data", AttributeValue::S(true.to_string()))
+                .send()
+                .await;
+            match resp {
+                Err(x) => {
+                    println!("{x:?}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Ok(_resp) => break,
+            }
+        }
+    }
+
+    /// Allow regular scaling.
+    pub async fn allow_regular_rescaling(&self) {
+        loop {
+            let resp = self
+                .dynamo_client
+                .delete_item()
+                .table_name("sbtree_rescaling")
+                .key("entry_type", AttributeValue::S("cleanup".into()))
+                .key("owner_id", AttributeValue::S("manager".into()))
+                .send()
+                .await;
+            match resp {
+                Err(x) => {
+                    println!("{x:?}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Ok(_resp) => break,
+            }
+        }
+    }
+
+    /// Allow regular scaling.
+    pub async fn can_do_regular_rescaling(&self) -> bool {
+        loop {
+            let resp = self
+                .dynamo_client
+                .get_item()
+                .table_name("sbtree_rescaling")
+                .key("entry_type", AttributeValue::S("cleanup".into()))
+                .key("owner_id", AttributeValue::S("manager".into()))
+                .send()
+                .await;
+            match resp {
+                Err(x) => {
+                    println!("{x:?}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Ok(resp) => {
+                    return resp.item().is_none();
+                }
+            }
         }
     }
 

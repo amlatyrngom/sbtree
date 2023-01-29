@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::btree::BTreeRespMeta;
+    use crate::{btree::BTreeRespMeta, BTreeClient};
     use obelisk::{ActorInstance, PersistentLog};
     use std::sync::Arc;
 
@@ -344,13 +344,81 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn simple_actor_test() {
-        reset_for_test().await;
         run_simple_actor_test().await;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // Write backs.
     }
 
     async fn run_simple_actor_test() {
-        
+        // Cleanup all data.
+        let btree_client = BTreeClient::new().await;
+        btree_client.cleanup().await;
+        // The empty key always maps to the empty value.
+        let value = btree_client.get("").await;
+        assert!(matches!(value, Some(v) if v.is_empty()));
+        // Lookup non-existent key.
+        let resp = btree_client.get("Amadou").await;
+        assert!(matches!(resp, None));
+        // Insert a key, then look it up.
+        btree_client.put("Amadou", b"Ngom".to_vec()).await;
+        let resp = btree_client.get("Amadou").await;
+        assert!(matches!(resp, Some(v) if v == b"Ngom"));
+        // Delete a key, then look it up.
+        btree_client.delete("Amadou").await;
+        let resp = btree_client.get("Amadou").await;
+        assert!(matches!(resp, None));
+        // Insert, cleanup, lookup.
+        btree_client.put("Amadou", b"Ngom".to_vec()).await;
+        btree_client.cleanup().await;
+        let resp = btree_client.get("Amadou").await;
+        assert!(matches!(resp, None));
     }
 
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn simple_actor_load_test() {
+        run_simple_actor_load_test().await;
+    }
+
+    async fn run_simple_actor_load_test() {
+        // Cleanup all data.
+        let btree_client = BTreeClient::new().await;
+        btree_client.cleanup().await;
+        // Load data.
+        let kvs = (0..1024).map(|key: usize| {
+            (key.to_string(), make_value(key, 1))
+        }).collect();
+        btree_client.load(kvs).await;
+        // Check content.
+        for key in 0..1024 {
+            if key % 128 == 0 { // Only check a few values, since messaging is slow on lambda.
+                let expected_val = make_value(key, 1);
+                let actual_val = btree_client.get(&key.to_string()).await;
+                assert!(matches!(actual_val, Some(actual_val) if expected_val == actual_val));                
+            }
+        }
+        // Delete half of values
+        let keys = (0..512).map(|key: usize| {
+            key.to_string()
+        }).collect();
+        btree_client.unload(keys).await;
+        // Check content.
+        for key in 0..1024 {
+            if key % 128 == 0 { // Only check a few values, since messaging is slow on lambda.
+                let expected_val = make_value(key, 1);
+                let actual_val = btree_client.get(&key.to_string()).await;
+                if key < 512 {
+                    assert!(matches!(actual_val, None));                
+                } else {
+                    assert!(matches!(actual_val, Some(actual_val) if expected_val == actual_val));
+                }
+            }
+        }
+        // Cleanup and check emptiness.
+        btree_client.cleanup().await;
+        for key in 0..1024 {
+            if key % 128 == 0 { // Only check a few values, since messaging is slow on lambda.
+                let actual_val = btree_client.get(&key.to_string()).await;
+                assert!(matches!(actual_val, None));                
+            }
+        }
+    }
 }

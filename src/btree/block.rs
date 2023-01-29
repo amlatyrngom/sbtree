@@ -170,11 +170,16 @@ impl BlockCache {
     }
 
     /// Reset load.
-    pub async fn reset_load(&self) {
+    pub async fn reset_load(&self) -> f64 {
         let mut stats = self.stats.lock().await;
         self.accessed_blocks.clear();
         stats.time = std::time::Instant::now();
-        stats.load = 1.0;
+        stats.load = if stats.load < 0.5 {
+            stats.load * 2.0
+        } else {
+            1.0
+        };
+        stats.load
     }
 
     /// Retrieve load.

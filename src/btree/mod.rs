@@ -18,8 +18,11 @@ pub enum BTreeReqMeta {
     Get { key: String },
     Put { key: String },
     Delete { key: String },
+    Load,
+    Unload,
     Manage,
     Rescale { op: RescalingOp },
+    Cleanup { worker: Option<String> },
 }
 
 /// Response metadata.
@@ -28,6 +31,7 @@ pub enum BTreeRespMeta {
     NotFound,
     Ok,
     BadOwner,
+    NetworkIssue,
     LockConflict,
     InvariantIssue,
 }
@@ -110,6 +114,8 @@ pub enum BTreeLogEntry {
         to_transfer: Vec<String>,
         remove_self: bool,
     },
+    /// Delete all.
+    DeleteAll,
 }
 
 /// BTree Actor.
@@ -135,6 +141,49 @@ impl ActorInstance for BTreeActor {
                 let manager = self.manager.clone().unwrap();
                 manager.manage().await;
                 (BTreeRespMeta::Ok, vec![])
+            }
+            BTreeReqMeta::Cleanup { worker } => self.cleanup(worker).await,
+            BTreeReqMeta::Load => {
+                self.tree_structure.block_cache.reset_load().await;
+                let kvs: Vec<(String, Vec<u8>)> = tokio::task::block_in_place(move || {
+                    bincode::deserialize(&payload).unwrap()
+                });
+                let mut not_owned = Vec::new();
+                for (key, value) in kvs {
+                    let (resp, _) = self.load_kv(&key, value.clone()).await;
+                    match resp {
+                        BTreeRespMeta::Ok => continue,
+                        _ => {
+                            not_owned.push((key, value));
+                        }
+                    }
+                }
+                let not_owned = tokio::task::block_in_place(move || {
+                    bincode::serialize(&not_owned).unwrap()
+                });
+                self.tree_structure.block_cache.reset_load().await;
+                (BTreeRespMeta::Ok, not_owned)
+            },
+            BTreeReqMeta::Unload => {
+                self.tree_structure.block_cache.reset_load().await;
+                let keys: Vec<String> = tokio::task::block_in_place(move || {
+                    bincode::deserialize(&payload).unwrap()
+                });
+                let mut not_owned = Vec::new();
+                for key in keys {
+                    let (resp, _) = self.unload_kv(&key).await;
+                    match resp {
+                        BTreeRespMeta::Ok => continue,
+                        _ => {
+                            not_owned.push(key);
+                        }
+                    }
+                }
+                let not_owned = tokio::task::block_in_place(move || {
+                    bincode::serialize(&not_owned).unwrap()
+                });
+                self.tree_structure.block_cache.reset_load().await;
+                (BTreeRespMeta::Ok, not_owned) 
             }
         };
         let resp = serde_json::to_string(&resp).unwrap();
@@ -408,6 +457,55 @@ impl BTreeActor {
         match ret {
             Some(value) => (BTreeRespMeta::Ok, value),
             None => (BTreeRespMeta::NotFound, vec![]),
+        }
+    }
+
+    pub async fn cleanup(&self, worker_id: Option<String>) -> (BTreeRespMeta, Vec<u8>) {
+        match worker_id {
+            Some(worker_id) => {
+                if worker_id != self.owner_id && !obelisk::common::has_external_access() {
+                    return (BTreeRespMeta::NetworkIssue, vec![]);
+                }
+                println!("Cleanup {worker_id}.");
+                let manager = self.manager.clone().unwrap();
+                // Complete any ongoing rescaling.
+                println!("Completing ongoing management.");
+                manager.manage().await;
+                // Lock manager and prevent rescaling.
+                println!("Locking manager.");
+                loop {
+                    let locked = manager.lock_manager().await;
+                    if locked {
+                        break;
+                    }
+                    println!("Manager already locked!");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                self.tree_structure
+                    .global_ownership
+                    .prevent_regular_rescaling()
+                    .await;
+                // If non manager, scale in.
+                if worker_id != self.owner_id {
+                    println!("Performing scale in to manager: {worker_id}.");
+                    let rescaling_op = RescalingOp::ScaleIn {
+                        from: worker_id.clone(),
+                        to: self.owner_id.clone(),
+                        uid: uuid::Uuid::new_v4().to_string(),
+                    };
+                    manager.manage_rescaling(rescaling_op, false).await;
+                }
+                // Unlock for next operation.
+                println!("Unlocking manager.");
+                manager.unlock_manager().await;
+                (BTreeRespMeta::Ok, vec![])
+            }
+            None => {
+                // Cleanup everything in manager, which should be the only worker by this step.
+                println!("Manager. Deleting all for cleanup");
+                self.tree_structure.delete_all(None).await;
+                (BTreeRespMeta::Ok, vec![])
+            }
         }
     }
 }
