@@ -22,7 +22,9 @@ pub enum BTreeReqMeta {
     Unload,
     Manage,
     Rescale { op: RescalingOp },
+    ForceRescale { op: Option<RescalingOp> },
     Cleanup { worker: Option<String> },
+    BulkLoad { okeys: Vec<String> },
 }
 
 /// Response metadata.
@@ -116,6 +118,8 @@ pub enum BTreeLogEntry {
     },
     /// Delete all.
     DeleteAll,
+    /// Bulk load
+    BulkLoad { okeys: Vec<String> },
 }
 
 /// BTree Actor.
@@ -137,38 +141,40 @@ impl ActorInstance for BTreeActor {
             BTreeReqMeta::Put { key } => self.put(&key, payload).await,
             BTreeReqMeta::Delete { key } => self.delete(&key).await,
             BTreeReqMeta::Rescale { op } => self.rescale(op).await,
+            BTreeReqMeta::ForceRescale { op } => self.force_rescale(op).await,
             BTreeReqMeta::Manage => {
                 let manager = self.manager.clone().unwrap();
                 manager.manage().await;
                 (BTreeRespMeta::Ok, vec![])
             }
             BTreeReqMeta::Cleanup { worker } => self.cleanup(worker).await,
+            BTreeReqMeta::BulkLoad { okeys } => self.bulk_load(okeys).await,
             BTreeReqMeta::Load => {
                 self.tree_structure.block_cache.reset_load().await;
-                let kvs: Vec<(String, Vec<u8>)> = tokio::task::block_in_place(move || {
-                    bincode::deserialize(&payload).unwrap()
-                });
+                let kvs: Vec<(String, Vec<u8>)> =
+                    tokio::task::block_in_place(move || bincode::deserialize(&payload).unwrap());
+                println!("Loading {} kv pairs.", kvs.len());
                 let mut not_owned = Vec::new();
                 for (key, value) in kvs {
                     let (resp, _) = self.load_kv(&key, value.clone()).await;
                     match resp {
                         BTreeRespMeta::Ok => continue,
-                        _ => {
+                        resp => {
+                            println!("Load resp: {resp:?}");
                             not_owned.push((key, value));
                         }
                     }
                 }
-                let not_owned = tokio::task::block_in_place(move || {
-                    bincode::serialize(&not_owned).unwrap()
-                });
+                println!("Resending {}.", not_owned.len());
+                let not_owned =
+                    tokio::task::block_in_place(move || bincode::serialize(&not_owned).unwrap());
                 self.tree_structure.block_cache.reset_load().await;
                 (BTreeRespMeta::Ok, not_owned)
-            },
+            }
             BTreeReqMeta::Unload => {
                 self.tree_structure.block_cache.reset_load().await;
-                let keys: Vec<String> = tokio::task::block_in_place(move || {
-                    bincode::deserialize(&payload).unwrap()
-                });
+                let keys: Vec<String> =
+                    tokio::task::block_in_place(move || bincode::deserialize(&payload).unwrap());
                 let mut not_owned = Vec::new();
                 for key in keys {
                     let (resp, _) = self.unload_kv(&key).await;
@@ -179,11 +185,10 @@ impl ActorInstance for BTreeActor {
                         }
                     }
                 }
-                let not_owned = tokio::task::block_in_place(move || {
-                    bincode::serialize(&not_owned).unwrap()
-                });
+                let not_owned =
+                    tokio::task::block_in_place(move || bincode::serialize(&not_owned).unwrap());
                 self.tree_structure.block_cache.reset_load().await;
-                (BTreeRespMeta::Ok, not_owned) 
+                (BTreeRespMeta::Ok, not_owned)
             }
         };
         let resp = serde_json::to_string(&resp).unwrap();
@@ -205,18 +210,24 @@ impl BTreeActor {
     /// Make actor.
     pub async fn new(name: &str, plog: Arc<PersistentLog>) -> Self {
         // Attempt recovery.
+        println!("BTreeActor::new(). Recovering.");
         let recovery = Recovery::new(name, plog.clone()).await;
         let (tree_structure, already_running) = recovery.recover().await;
+        println!("BTreeActor::new(). Done recovering.");
         if !already_running {
+            println!("BTreeActor::new(). Initializing.");
             tree_structure.initialize().await;
+            println!("BTreeActor::new(). Done initializing.");
         }
         // Mark as running and truncate all previous logs.
+        println!("BTreeActor::new(). Checkpointing and logging!");
         let old_flush_lsn = tree_structure.plog.get_flush_lsn().await;
         {
             let mut running_state = tree_structure.running_state.write().await;
             running_state.checkpoint().await;
         }
-        tree_structure.plog.truncate(old_flush_lsn).await;
+        tree_structure.plog.truncate(old_flush_lsn).await.unwrap();
+        println!("BTreeActor::new(). Done checkpointing and logging!");
         let tree_structure = Arc::new(tree_structure);
         let manager = if name == "manager" {
             let manager = BTreeManager::new(tree_structure.global_ownership.clone()).await;
@@ -233,6 +244,7 @@ impl BTreeActor {
             });
         }
         // Now make worker
+        println!("BTreeActor::new(). Finished making object.");
         BTreeActor {
             owner_id: name.into(),
             tree_structure,
@@ -260,7 +272,7 @@ impl BTreeActor {
             // Flush.
             let plog = tree_structure.plog.clone();
             tokio::spawn(async move {
-                plog.flush(None).await;
+                plog.flush().await;
             });
             // Check if should truncate.
             if now.duration_since(last_truncation) > truncation_duration {
@@ -290,15 +302,57 @@ impl BTreeActor {
 
     /// Rescale.
     pub async fn rescale(&self, op: RescalingOp) -> (BTreeRespMeta, Vec<u8>) {
+        println!("Worker {}. Received rescaling: {op:?}", self.owner_id);
         let (rescaling_uid, from, to, scaling_in) = match op {
             RescalingOp::ScaleIn { from, to, uid } => (uid, from, to, true),
             RescalingOp::ScaleOut { from, to, uid } => (uid, from, to, false),
         };
         let remove_self = self.owner_id == from && scaling_in;
+        println!("Should remove self: {remove_self}");
         self.tree_structure
             .perform_rescaling(&rescaling_uid, &to, remove_self, None)
             .await;
         (BTreeRespMeta::Ok, vec![])
+    }
+
+    /// Forcibly rescale. Should only be sent to manager.
+    pub async fn force_rescale(&self, op: Option<RescalingOp>) -> (BTreeRespMeta, Vec<u8>) {
+        match op {
+            None => {
+                self.tree_structure
+                    .global_ownership
+                    .allow_regular_rescaling()
+                    .await;
+                (BTreeRespMeta::Ok, vec![])
+            }
+            Some(op) => {
+                println!("Received force rescaling request!");
+                if !obelisk::common::has_external_access() {
+                    return (BTreeRespMeta::NetworkIssue, vec![]);
+                }
+                let manager = self.manager.clone().unwrap();
+                // Complete any ongoing rescaling.
+                println!("Completing ongoing management.");
+                manager.manage().await;
+                // Lock manager and prevent rescaling.
+                println!("Locking manager.");
+                let _locked = loop {
+                    let locked = manager.lock_manager().await;
+                    if !locked.is_none() {
+                        break locked;
+                    }
+                    println!("Manager already locked!");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                };
+                self.tree_structure
+                    .global_ownership
+                    .prevent_regular_rescaling()
+                    .await;
+                println!("Performing forcible rescale: {op:?}.");
+                manager.manage_rescaling(op, false).await;
+                (BTreeRespMeta::Ok, vec![])
+            }
+        }
     }
 
     /// Will bypass logging. Used only to load data for tests.
@@ -436,8 +490,6 @@ impl BTreeActor {
             Err(resp) => return (resp, vec![]),
         };
 
-        // println!("BTreeActor::get(). Leaf ID = {}; Split Key = {}; Key={key};", lookup_res.leaf_id, String::from_utf8(lookup_res.split_key.clone()).unwrap());
-
         // Read value.
         let ret = {
             let leaf = lookup_res.leaf.read().await;
@@ -460,6 +512,11 @@ impl BTreeActor {
         }
     }
 
+    pub async fn bulk_load(&self, okeys: Vec<String>) -> (BTreeRespMeta, Vec<u8>) {
+        self.tree_structure.bulk_load(okeys, None).await;
+        (BTreeRespMeta::Ok, vec![])
+    }
+
     pub async fn cleanup(&self, worker_id: Option<String>) -> (BTreeRespMeta, Vec<u8>) {
         match worker_id {
             Some(worker_id) => {
@@ -473,14 +530,14 @@ impl BTreeActor {
                 manager.manage().await;
                 // Lock manager and prevent rescaling.
                 println!("Locking manager.");
-                loop {
+                let _locked = loop {
                     let locked = manager.lock_manager().await;
-                    if locked {
-                        break;
+                    if locked.is_some() {
+                        break locked;
                     }
                     println!("Manager already locked!");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                };
                 self.tree_structure
                     .global_ownership
                     .prevent_regular_rescaling()
@@ -495,9 +552,6 @@ impl BTreeActor {
                     };
                     manager.manage_rescaling(rescaling_op, false).await;
                 }
-                // Unlock for next operation.
-                println!("Unlocking manager.");
-                manager.unlock_manager().await;
                 (BTreeRespMeta::Ok, vec![])
             }
             None => {

@@ -1,6 +1,14 @@
 namespace = "sbtree"
 
+[functional]
+path = "sbtree::BenchFn"
+mem_size = 512
+timeout = 10
+concurrency = 1
+
 [messaging]
 path = "sbtree::BTreeActor"
 mem_size = 1024
-timeout = 5
+timeout = 10
+fn_mem = 512
+caller_mem = 512

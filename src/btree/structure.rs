@@ -117,12 +117,11 @@ impl BTreeStructure {
             let new_load = self.block_cache.reset_load().await;
             self.global_ownership.update_load(new_load).await;
             let this = self.clone();
-            tokio::spawn(async move {
-                // Must do this async to avoid deadlock.
-                this.fetch_new_ownership().await;
-            });
+            this.fetch_new_ownership(true).await; // Lock already held.
             let mut running_state = self.running_state.write().await;
-            running_state.mark_active(true).await;
+            running_state.last_rescaling_uid = rescaling_uid.into();
+            running_state.is_active = true;
+            running_state.checkpoint().await;
             return;
         }
         // If source to ownership change, must transfer nodes after guarantees that all ongoing queries are finished.
@@ -151,6 +150,7 @@ impl BTreeStructure {
                 (to_transfer, locks)
             }
         };
+        println!("Transferring keys: {to_transfer:?}. RemoveSelf={remove_self}");
         // Log operation if not recovering.
         let lsn = match recovery {
             Some((lsn, _)) => lsn,
@@ -170,22 +170,27 @@ impl BTreeStructure {
             self.block_cache
                 .remove_ownership_key(ownership_key, false)
                 .await;
+            // Redo the remove here in case we are recovering.
             let mut ownership = self.ownership.write().await;
             ownership.remove(ownership_key);
         }
         self.global_ownership
             .perform_ownership_transfer(to_owner, to_transfer)
             .await;
+        // Write running state.
         if remove_self {
+            let mut running_state = self.running_state.write().await;
+            running_state.is_active = false;
+            running_state.last_rescaling_uid = rescaling_uid.into();
+            running_state.checkpoint().await;
             self.global_ownership.remove_load().await;
         } else {
-            self.block_cache.reset_load().await;
-            self.global_ownership.update_load(1.0).await;
-        }
-        // Update running state.
-        {
             let mut running_state = self.running_state.write().await;
-            running_state.mark_rescaling(rescaling_uid).await;
+            running_state.is_active = true;
+            running_state.last_rescaling_uid = rescaling_uid.into();
+            running_state.checkpoint().await;
+            let new_load = self.block_cache.reset_load().await;
+            self.global_ownership.update_load(new_load).await;
         }
         Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
     }
@@ -361,7 +366,7 @@ impl BTreeStructure {
                 if self.owner_id != owner_id {
                     let this = self.clone();
                     tokio::spawn(async move {
-                        this.fetch_new_ownership().await;
+                        this.fetch_new_ownership(false).await;
                     });
                     return Err(BTreeRespMeta::BadOwner);
                 } else {
@@ -374,7 +379,7 @@ impl BTreeStructure {
         if !ownership.contains_key(&ownership_key) {
             let this = self.clone();
             tokio::spawn(async move {
-                this.fetch_new_ownership().await;
+                this.fetch_new_ownership(false).await;
             });
             return Err(BTreeRespMeta::LockConflict);
         }
@@ -497,7 +502,7 @@ impl BTreeStructure {
         let root = self.block_cache.pin(&ownership_key, &root_id).await;
         if root.is_none() {
             // This should never occur. Since we create a default root.
-            self.block_cache.unpin(&root_id).await;
+            println!("WARNING: Block({ownership_key}, {root_id}) not found!");
             return Err(BTreeRespMeta::InvariantIssue);
         }
         let root = root.unwrap();
@@ -554,8 +559,14 @@ impl BTreeStructure {
 
     /// Refresh ownership to acquire new ownership keys.
     /// Old ownership keys should be removed in a different way.
-    async fn fetch_new_ownership(&self) {
-        let _ownership_change_lock = self.ownership_change_lock.write().await;
+    async fn fetch_new_ownership(&self, already_locked: bool) {
+        let _ownership_change_lock = if already_locked {
+            None
+        } else {
+            let ownership_change_lock = self.ownership_change_lock.write().await;
+            Some(ownership_change_lock)
+        };
+        println!("Fetching new ownership!");
         let new_ownership: HashSet<String> = self
             .global_ownership
             .fetch_ownership_keys()
@@ -570,6 +581,7 @@ impl BTreeStructure {
             let mut ownership = self.ownership.write().await;
             for new_key in new_ownership {
                 if !old_ownership.contains(&new_key) {
+                    println!("Adding new ownership: {new_key:?}");
                     ownership.insert(new_key, Arc::new(tokio::sync::RwLock::new(())));
                 }
             }
@@ -831,7 +843,7 @@ impl BTreeStructure {
             let split_key = String::from_utf8(split_key).unwrap();
             let new_ownership_key = format!("/okey/{split_key}");
             let new_root_id = LocalOwnership::block_id_from_key(&new_ownership_key);
-            new_root.block_id = new_root_id;
+            new_root.block_id = new_root_id.clone();
             // Persist log entry if not recovering.
             let lsn = match recovery {
                 Some((lsn, _, _)) => lsn,
@@ -855,6 +867,10 @@ impl BTreeStructure {
                 .move_ownership(ownership_key, &new_ownership_key, to_transfer)
                 .await;
             // Write new root, then old root.
+            println!(
+                "Creating new root({new_ownership_key}, {new_root_id}, {})",
+                new_root.block_id
+            );
             let create_ch = self.block_cache.create(&new_ownership_key, new_root).await;
             create_ch.await.unwrap();
             let write_ch = self
@@ -957,7 +973,7 @@ impl BTreeStructure {
             .remove_ownership_key(from_ownership_key, true)
             .await;
         self.global_ownership
-            .remove_ownership_key(&self.owner_id, from_ownership_key)
+            .remove_ownership_key(&self.owner_id, from_ownership_key, true)
             .await;
 
         // Synchronously write completion record now that all operations are done.
@@ -1044,7 +1060,8 @@ impl BTreeStructure {
             Some(lsn) => lsn,
             None => {
                 let log_entry = BTreeLogEntry::DeleteAll;
-                Recovery::write_log_entry(self.plog.clone(), log_entry).await
+                let lsn = Recovery::write_log_entry(self.plog.clone(), log_entry).await;
+                lsn
             }
         };
         // Remove all ownerships.
@@ -1053,13 +1070,13 @@ impl BTreeStructure {
                 .remove_ownership_key(ownership_key, true)
                 .await;
             self.global_ownership
-                .remove_ownership_key(&self.owner_id, ownership_key)
+                .remove_ownership_key(&self.owner_id, ownership_key, true)
                 .await;
             let mut ownership = self.ownership.write().await;
             ownership.remove(ownership_key);
         }
-        // Truncate log up to DeleteAll entry.
-        self.plog.truncate(lsn - 1).await;
+        // Truncate log up to DeleteAll entry. TODO: Should probably delete lingering dbs too.
+        self.plog.truncate(lsn - 1).await.unwrap();
         // Reinitialize.
         self.initialize().await;
         let new_running_state = RunningState::new(self.plog.clone(), true, 1, "");
@@ -1070,5 +1087,60 @@ impl BTreeStructure {
         }
         Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
         self.global_ownership.allow_regular_rescaling().await;
+    }
+
+    pub async fn bulk_load(&self, okeys: Vec<String>, recovery: Option<usize>) {
+        // Log for recovery.
+        let lsn = match recovery {
+            Some(lsn) => lsn,
+            None => {
+                let log_entry = BTreeLogEntry::BulkLoad {
+                    okeys: okeys.clone(),
+                };
+                let lsn = Recovery::write_log_entry(self.plog.clone(), log_entry).await;
+                lsn
+            }
+        };
+        println!("Bulk load: {okeys:?}");
+        let shared_config = aws_config::load_from_env().await;
+        let s3_client = aws_sdk_s3::Client::new(&shared_config); // Should be cached.
+        let mut ts = Vec::new();
+        // Go through ownership keys.
+        for ownership_key in okeys {
+            let s3_client = s3_client.clone();
+            let block_cache = self.block_cache.clone();
+            let global_ownership = self.global_ownership.clone();
+            let owner_id = self.owner_id.clone();
+            let ownership = self.ownership.clone();
+            ts.push(tokio::spawn(async move {
+                let ownership_key = &ownership_key;
+                let block_id = LocalOwnership::block_id_from_key(ownership_key);
+                let data_file = LocalOwnership::data_file_from_key(ownership_key);
+                let load_dir = "/sbtree/loading";
+                let s3_key = format!("{load_dir}/{block_id}");
+                let resp = s3_client
+                    .get_object()
+                    .bucket(&obelisk::common::bucket_name())
+                    .key(&s3_key)
+                    .send()
+                    .await
+                    .unwrap();
+                let body: Vec<u8> = resp.body.collect().await.unwrap().into_bytes().to_vec();
+                println!("Writing to fs: {block_id}. Len={}", body.len());
+                block_cache.remove_ownership_key(ownership_key, true).await;
+                tokio::fs::write(data_file, body).await.unwrap();
+                global_ownership
+                    .add_ownership_key(&owner_id, ownership_key)
+                    .await;
+                let mut ownership = ownership.write().await;
+                ownership.insert(ownership_key.into(), Arc::new(RwLock::new(())));
+            }))
+        }
+        // Wait for writes.
+        for t in ts {
+            t.await.unwrap();
+        }
+
+        Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
     }
 }

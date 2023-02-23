@@ -1,25 +1,26 @@
 use super::{BTreeReqMeta, RescalingOp};
 use crate::global_ownership::GlobalOwnership;
-use obelisk::common::leasing::Leaser;
-use obelisk::common::scaling_table_name;
-use std::sync::{Arc, Mutex};
+// use obelisk::common::leasing::Leaser;
+// use obelisk::common::scaling_table_name;
+use std::sync::Arc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// BTree Manager.
 pub struct BTreeManager {
     global_ownership: Arc<GlobalOwnership>,
-    leaser: Leaser,
-    managing: Arc<Mutex<bool>>,
+    // leaser: Leaser,
+    managing_lock: Arc<Mutex<()>>,
 }
 
 impl BTreeManager {
     /// Create a new manager.
     pub async fn new(global_ownership: Arc<GlobalOwnership>) -> Self {
-        let leaser = Leaser::new(&scaling_table_name("messaging")).await;
-        let managing = Arc::new(Mutex::new(false));
+        // let leaser = Leaser::new(&scaling_table_name("messaging")).await;
+        let managing_lock = Arc::new(Mutex::new(()));
         BTreeManager {
             global_ownership,
-            leaser,
-            managing,
+            // leaser,
+            managing_lock,
         }
     }
 
@@ -39,12 +40,14 @@ impl BTreeManager {
         };
         let req = serde_json::to_string(&req).unwrap();
         loop {
+            println!("Sending rescale to: {from:?}");
             let resp = from_mc.send_message(&req, &[]).await;
             if resp.is_some() {
                 break;
             }
         }
         loop {
+            println!("Sending rescale to: {to:?}");
             let resp = to_mc.send_message(&req, &[]).await;
             if resp.is_some() {
                 break;
@@ -54,38 +57,32 @@ impl BTreeManager {
     }
 
     /// Prevent concurrent rescaling.
-    pub async fn lock_manager(&self) -> bool {
-        // Renew lease.
-        println!("Trying to renew lease");
-        let acquired = self.leaser.renew("sbtree_management_leasing", false).await;
-        if !acquired {
-            return false;
-        }
+    pub async fn lock_manager(&self) -> Option<OwnedMutexGuard<()>> {
+        // // Renew lease.
+        // println!("Trying to renew lease!");
+        // let acquired = self.leaser.renew("sbtree_management_leasing", false).await;
+        // if !acquired {
+        //     println!("Could not acquire lease!");
+        //     return None;
+        // }
+        // println!("Acquired lease!");
         // Only allow one management task at a time.
-        {
-            let mut managing = self.managing.lock().unwrap();
-            if *managing {
-                return false;
-            } else {
-                *managing = true;
-            }
+        let lock = self.managing_lock.clone().try_lock_owned().ok();
+        if lock.is_none() {
+            println!("Could not try_lock!");
+            return None;
         }
-        // Keep lease fresh. This is not perfect to remove duplicate rescaling.
-        // But the only correctness issue, is avoiding overwriting rescaling, which we do.
-        let leaser = self.leaser.clone();
-        tokio::spawn(async move {
-            for _ in 0..10 {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                leaser.renew("sbtree_management_leasing", false).await;
-            }
-        });
-        true
-    }
-
-    /// Unlock.
-    pub async fn unlock_manager(&self) {
-        let mut managing = self.managing.lock().unwrap();
-        *managing = false;
+        println!("Successful try_lock!");
+        // // Keep lease fresh. This is not perfect to remove duplicate rescaling.
+        // // But the only correctness issue, is avoiding overwriting rescaling, which we do.
+        // let leaser = self.leaser.clone();
+        // tokio::spawn(async move {
+        //     for _ in 0..10 {
+        //         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        //         leaser.renew("sbtree_management_leasing", false).await;
+        //     }
+        // });
+        lock
     }
 
     /// Perform management tasks.
@@ -99,7 +96,7 @@ impl BTreeManager {
         }
         // Prevent concurrent ops.
         let locked = self.lock_manager().await;
-        if !locked {
+        if locked.is_none() {
             return;
         }
         // If there is an ongoing rescaling, perform it.
@@ -179,7 +176,5 @@ impl BTreeManager {
                 }
             }
         }
-        // Allow next operation to proceed.
-        self.unlock_manager().await;
     }
 }

@@ -277,14 +277,10 @@ impl GlobalOwnership {
             inner.rescaling_op = Some(rescaling_op.clone());
         }
         match rescaling_op {
-            RescalingOp::ScaleIn {
-                from,
-                to: _,
-                uid: _,
-            } => {
+            RescalingOp::ScaleIn { from, to, uid: _ } => {
                 // Mark `from` as free, and `to` as busy.
                 self.mark_owner_state(&from, true).await;
-                self.mark_owner_state(&from, false).await;
+                self.mark_owner_state(&to, false).await;
             }
             RescalingOp::ScaleOut { from, to, uid: _ } => {
                 // Mark `from` and `to` as busy.
@@ -399,6 +395,7 @@ impl GlobalOwnership {
     /// Remove load.
     pub async fn remove_load(&self) {
         let owner_id = self.owner_id.clone().unwrap();
+        println!("Deleting load: {owner_id}");
         loop {
             let resp = self
                 .dynamo_client
@@ -408,6 +405,7 @@ impl GlobalOwnership {
                 .key("owner_id", AttributeValue::S(owner_id.clone()))
                 .send()
                 .await;
+            println!("Delete load resp: {resp:?}");
             match resp {
                 Err(x) => {
                     let x = format!("{x:?}");
@@ -474,7 +472,8 @@ impl GlobalOwnership {
         let from = self.owner_id.clone().unwrap();
         for ownership_key in ownership_keys {
             self.add_ownership_key(to, &ownership_key).await;
-            self.remove_ownership_key(&from, &ownership_key).await;
+            self.remove_ownership_key(&from, &ownership_key, false)
+                .await;
         }
     }
 
@@ -509,7 +508,7 @@ impl GlobalOwnership {
     }
 
     /// Remove an ownership key.
-    pub async fn remove_ownership_key(&self, owner_id: &str, ownership_key: &str) {
+    pub async fn remove_ownership_key(&self, owner_id: &str, ownership_key: &str, delete: bool) {
         loop {
             let resp = self
                 .dynamo_client
@@ -532,49 +531,24 @@ impl GlobalOwnership {
                 Ok(_resp) => break,
             }
         }
-        let mut inner = self.inner.write().unwrap();
-        inner.ownership_keys.remove(ownership_key);
+
+        if delete {
+            let mut inner = self.inner.write().unwrap();
+            inner.ownership_keys.remove(ownership_key);
+        }
     }
 
     /// Fetch the keys owned by this owner.
     pub async fn fetch_ownership_keys(&self) -> Vec<String> {
         let owner_id = self.owner_id.clone().unwrap();
-        loop {
-            let resp = self
-                .dynamo_client
-                .execute_statement()
-                .statement("SELECT ownership_key FROM sbtree_ownership WHERE owner_id=?")
-                .parameters(AttributeValue::S(owner_id.clone()))
-                .consistent_read(true)
-                .send()
-                .await;
-            match resp {
-                Err(x) => {
-                    let x = format!("{x:?}");
-                    if Self::is_normal_dynamo_error(&x) {
-                        // Sleep to avoid high request rate on dynamo.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        panic!("Bad dynamo error {x}");
-                    }
-                    continue;
-                }
-                Ok(resp) => {
-                    let items = match resp.items() {
-                        None => break vec![],
-                        Some(items) => items,
-                    };
-                    let resp: Vec<String> = items
-                        .iter()
-                        .map(|item| {
-                            let ownership_key =
-                                item.get("ownership_key").unwrap().as_s().cloned().unwrap();
-                            ownership_key
-                        })
-                        .collect();
-                    break resp;
-                }
-            }
-        }
+        self.refresh_ownership_keys().await;
+        let ownership = self.inner.read().unwrap();
+        ownership
+            .ownership_keys
+            .iter()
+            .filter(|(_okey, oid)| **oid == owner_id)
+            .map(|(okey, _)| okey.clone())
+            .collect()
     }
 
     /// Returns the owner of a key.
@@ -620,6 +594,7 @@ impl GlobalOwnership {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         panic!("Bad dynamo error {x}");
                     }
+                    println!("{x:?}");
                     continue;
                 }
                 Ok(resp) => {
@@ -644,6 +619,12 @@ impl GlobalOwnership {
                 }
             }
         }
+    }
+
+    /// Return all ownership keys.
+    pub async fn all_ownership_keys(&self) -> BTreeMap<String, String> {
+        let inner = self.inner.write().unwrap();
+        inner.ownership_keys.clone()
     }
 
     /// Get or make messaging client.

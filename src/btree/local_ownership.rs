@@ -17,32 +17,29 @@ impl LocalOwnership {
 
     /// Fetch a block.
     pub async fn fetch_raw_block(&self, block_id: &str) -> Option<Vec<u8>> {
-        tokio::task::block_in_place(move || {
-            loop {
-                let conn = match self.pool.get() {
-                    Ok(conn) => conn,
-                    Err(x) => {
-                        println!("{x:?}");
-                        continue;
-                    }
-                };
-                let resp = conn.query_row(
-                    "SELECT data FROM blocks WHERE block_id=?",
-                    [block_id],
-                    |row| row.get(0),
-                );
-                match resp {
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        break None;
-                    }
-                    Err(x) => {
-                        println!("{x:?}");
-                        continue;
-                    }
-                    Ok(data) => {
-                        // Force type checking.
-                        break Some(data);
-                    }
+        tokio::task::block_in_place(move || loop {
+            let conn = match self.pool.get() {
+                Ok(conn) => conn,
+                Err(x) => {
+                    println!("{x:?}");
+                    continue;
+                }
+            };
+            let resp = conn.query_row(
+                "SELECT data FROM blocks WHERE block_id=?",
+                [block_id],
+                |row| row.get(0),
+            );
+            match resp {
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    break None;
+                }
+                Err(x) => {
+                    println!("{x:?}");
+                    continue;
+                }
+                Ok(data) => {
+                    break Some(data);
                 }
             }
         })
@@ -128,7 +125,7 @@ impl LocalOwnership {
                     std::process::exit(1);
                 }
             }
-        })
+        });
     }
 
     /// Move from source to destination.
@@ -293,6 +290,45 @@ impl LocalOwnership {
         }
     }
 
+    /// Release lock on file.
+    pub async fn release(self) {
+        tokio::task::block_in_place(move || {
+            let conn = loop {
+                match self.pool.get() {
+                    Ok(conn) => break conn,
+                    Err(x) => {
+                        println!("MoveBlocks: {x:?}");
+                        continue;
+                    }
+                };
+            };
+            match conn.pragma_update(None, "journal_mode", "delete") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Cannot release: {x:?}");
+                    std::process::exit(1);
+                }
+            }
+            match conn.pragma_update(None, "locking_mode", "normal") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Cannot release: {x:?}");
+                    std::process::exit(1);
+                }
+            }
+            // Actually release lock in sqlite.
+            match conn.query_row("SELECT unique_row FROM incarnation", [], |r| r.get(0)) {
+                Ok(res) => {
+                    let _res: usize = res;
+                }
+                Err(x) => {
+                    println!("Cannot release: {x:?}");
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
     /// Delete database.
     pub async fn delete(self) {
         let db_file = self.db_file.clone();
@@ -315,13 +351,17 @@ impl LocalOwnership {
         general_purpose::URL_SAFE_NO_PAD.encode(key)
     }
 
-    /// Create database.
-    pub fn new_sync(ownership_key: &str) -> Self {
+    pub fn data_file_from_key(key: &str) -> String {
         let fs_prefix = obelisk::common::shared_storage_prefix();
         let fs_prefix = format!("{fs_prefix}/sless_btree/data");
         let _create_dir_resp = std::fs::create_dir_all(&fs_prefix);
-        let ownership_key = general_purpose::URL_SAFE_NO_PAD.encode(ownership_key);
-        let db_file = format!("{fs_prefix}/{ownership_key}.db");
+        let ownership_key = Self::block_id_from_key(key);
+        format!("{fs_prefix}/{ownership_key}.db")
+    }
+
+    /// Create database.
+    pub fn new_sync(ownership_key: &str) -> Self {
+        let db_file = Self::data_file_from_key(ownership_key);
         let mut first = true;
         loop {
             if !first {
@@ -344,6 +384,20 @@ impl LocalOwnership {
                     continue;
                 }
             };
+            match conn.pragma_update(None, "locking_mode", "exclusive") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("NewLocalOwnership: {x:?}");
+                    continue;
+                }
+            }
+            match conn.pragma_update(None, "journal_mode", "ps") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("NewLocalOwnership: {x:?}");
+                    continue;
+                }
+            }
             let txn = match conn.transaction() {
                 Ok(txn) => txn,
                 Err(x) => {
@@ -383,7 +437,7 @@ impl LocalOwnership {
             };
             match txn.commit() {
                 Ok(_) => {
-                    println!("Successfully opened database!");
+                    println!("Successfully opened database {ownership_key} at {db_file}!");
                     return LocalOwnership {
                         pool,
                         incarnation_num,

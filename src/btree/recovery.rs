@@ -37,18 +37,6 @@ impl RunningState {
         next_id
     }
 
-    /// Mark this node as active or inactive.
-    pub async fn mark_active(&mut self, active: bool) {
-        self.is_active = active;
-        self.checkpoint().await;
-    }
-
-    /// Mark the last performed rescaling.
-    pub async fn mark_rescaling(&mut self, last_rescaling_uid: &str) {
-        self.last_rescaling_uid = last_rescaling_uid.to_string();
-        self.checkpoint().await;
-    }
-
     /// Checkpoint current running state.
     pub async fn checkpoint(&mut self) {
         let log_entry = BTreeLogEntry::Running {
@@ -58,7 +46,7 @@ impl RunningState {
         };
         let log_entry = bincode::serialize(&log_entry).unwrap();
         self.plog.enqueue(log_entry).await;
-        self.plog.flush(None).await;
+        self.plog.flush().await;
     }
 }
 
@@ -68,11 +56,43 @@ pub struct Recovery {
 }
 
 impl Recovery {
+    /// Make recovery object.
     pub async fn new(owner_id: &str, plog: Arc<PersistentLog>) -> Self {
         let tree_structure = BTreeStructure::new(owner_id, plog).await;
         Recovery {
             recovery_lock: Arc::new(RwLock::new(())),
             tree_structure,
+        }
+    }
+
+    /// Allow flushing while recovery is ongoing.
+    async fn recovery_flusher(
+        plog: Arc<PersistentLog>,
+        recovery_lock: Arc<RwLock<()>>,
+        mut done_rx: oneshot::Receiver<()>,
+    ) {
+        let mut done = false;
+        println!("Recovery::recovery_flusher(). Start.");
+        let mut i = 0;
+        loop {
+            if !done {
+                done = done_rx.try_recv().is_ok();
+            }
+            // Also Wait until all async writes are over.
+            if done {
+                println!("Recovery::recovery_flusher(). Done waiting for signal.");
+                let no_ongoing_write = recovery_lock.try_write().is_ok();
+                if no_ongoing_write {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            plog.flush().await;
+            i += 1;
+            if i % 100 == 0 {
+                let flush_lsn = plog.get_flush_lsn().await;
+                println!("Recovery::recovery_flusher(i={i}). flush_lsn={flush_lsn}.");
+            }
         }
     }
 
@@ -85,6 +105,13 @@ impl Recovery {
         let mut to_replay: BTreeMap<usize, BTreeLogEntry> = BTreeMap::new();
         loop {
             let entries = tree_structure.plog.replay(curr_start_lsn).await;
+            let entries = match entries {
+                Ok(entries) => entries,
+                Err(x) => {
+                    println!("Safe Truncate: {x:?}");
+                    return;
+                }
+            };
             if entries.is_empty() {
                 break;
             }
@@ -120,7 +147,7 @@ impl Recovery {
                 let mut running_state = tree_structure.running_state.write().await;
                 running_state.checkpoint().await;
             }
-            tree_structure.plog.truncate(min_lsn_after - 1).await;
+            let _ = tree_structure.plog.truncate(min_lsn_after - 1).await;
         }
     }
 
@@ -128,14 +155,34 @@ impl Recovery {
         let mut curr_start_lsn = 0;
         let mut already_running = false;
         let mut to_replay: BTreeMap<usize, BTreeLogEntry> = BTreeMap::new();
+        println!("Recovery::recover(). Starting recovery.");
+        // Spawn recovery flusher
+        let done_tx = {
+            let (done_tx, done_rx) = oneshot::channel();
+            let plog = self.tree_structure.plog.clone();
+            let recovery_lock = self.recovery_lock.clone();
+            tokio::spawn(async move {
+                Self::recovery_flusher(plog, recovery_lock, done_rx).await;
+            });
+            done_tx
+        };
         loop {
             let entries = self.tree_structure.plog.replay(curr_start_lsn).await;
+            let entries = match entries {
+                Ok(entries) => entries,
+                Err(x) => {
+                    println!("Safe Truncate: {x:?}");
+                    // Must own db at this point.
+                    std::process::exit(1);
+                }
+            };
             if entries.is_empty() {
                 break;
             }
             for (lsn, entry) in entries {
                 curr_start_lsn = lsn;
                 let entry: BTreeLogEntry = bincode::deserialize(&entry).unwrap();
+                println!("Recovery::recover(). Found entry ({lsn}): {entry:?}.");
                 match entry {
                     BTreeLogEntry::Completion { lsn } => {
                         to_replay.remove(&lsn);
@@ -147,6 +194,7 @@ impl Recovery {
             }
         }
         for (lsn, entry) in to_replay {
+            println!("Recovery::recover(). Replaying ({lsn}): {entry:?}.");
             match entry {
                 BTreeLogEntry::Running {
                     next_block_id,
@@ -260,9 +308,18 @@ impl Recovery {
                 BTreeLogEntry::DeleteAll => {
                     self.recover_delete_all(lsn).await;
                 }
+                BTreeLogEntry::BulkLoad { okeys } => {
+                    self.recover_bulk_load(lsn, okeys).await;
+                }
             }
         }
+        done_tx.send(()).unwrap();
         (self.tree_structure, already_running)
+    }
+
+    async fn recover_bulk_load(&mut self, lsn: usize, okeys: Vec<String>) {
+        let _recovery_exclusive = self.recovery_lock.clone().write_owned().await;
+        self.tree_structure.bulk_load(okeys, Some(lsn)).await;
     }
 
     async fn recover_delete_all(&mut self, lsn: usize) {
@@ -421,7 +478,7 @@ impl Recovery {
         let leaf = self
             .tree_structure
             .block_cache
-            .pin(ownership_key, root_id)
+            .pin(ownership_key, leaf_id)
             .await
             .unwrap();
         // Recover.
@@ -509,20 +566,18 @@ impl Recovery {
 
     /// Write log entry and wait for it to be flushed.
     pub async fn write_log_entry(plog: Arc<PersistentLog>, log_entry: BTreeLogEntry) -> usize {
-        tokio::task::block_in_place(move || {
-            let log_entry = bincode::serialize(&log_entry).unwrap();
-            let lsn = plog.enqueue_sync(log_entry);
-            loop {
-                // Hacky. Use condition variables instead.
-                // Since the commit interval is >1 milliseconds, waiting 1ms is not a big deal.
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                let flush_lsn = plog.get_flush_lsn_sync();
-                if flush_lsn >= lsn {
-                    break;
-                }
+        let log_entry = bincode::serialize(&log_entry).unwrap();
+        let lsn = plog.enqueue(log_entry).await;
+        loop {
+            // Hacky. Use condition variables instead.
+            // Since the flush interval is >=1 milliseconds, waiting <1ms is not a big deal.
+            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+            let flush_lsn = plog.get_flush_lsn().await;
+            if flush_lsn >= lsn {
+                break;
             }
-            lsn
-        })
+        }
+        lsn
     }
 
     /// Wait for a set of writes to complete.

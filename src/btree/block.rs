@@ -34,7 +34,7 @@ pub struct TreeBlock {
 pub struct BlockCache {
     transfer: Arc<Mutex<Transfer>>,
     inner: Arc<Mutex<BlockCacheInner>>,
-    total_mem: usize,
+    _total_mem: usize,
     accessed_blocks: dashmap::DashSet<String>,
     stats: Arc<Mutex<BlockCacheStats>>,
     local_ownership: Arc<RwLock<HashMap<String, LocalOwnership>>>,
@@ -94,7 +94,7 @@ impl BlockCache {
             transfer,
             inner,
             stats,
-            total_mem,
+            _total_mem: total_mem,
             accessed_blocks: dashmap::DashSet::new(),
         }
     }
@@ -158,6 +158,11 @@ impl BlockCache {
             if let Some(db) = db {
                 db.delete().await;
             }
+        } else {
+            println!("Release ownership: {ownership_key}");
+            if let Some(db) = db {
+                db.release().await;
+            }
         }
     }
 
@@ -195,9 +200,8 @@ impl BlockCache {
         // Estimate accessed size and reset set of accessed blocks.
         let access_size = (self.accessed_blocks.len() * TARGET_LEAF_SIZE) as f64;
         self.accessed_blocks.clear();
-        // Compute load.
-        let total_mem = self.total_mem as f64;
-        stats.load = access_size / total_mem;
+        // Compute load. Access / 1GB.
+        stats.load = access_size / (1.0 * 1024.0 * 1024.0);
         if !obelisk::common::has_external_access() {
             // Should never scale out while the actor is a lambda.
             // Likewise, should only scale in under very low activity.

@@ -14,6 +14,7 @@ base64 = "0.21.0"
 lru = "*"
 dashmap = "*"
 aws-sdk-dynamodb = "*"
+aws-sdk-s3 = "*"
 aws-config = "*"
 rusqlite = { version = "*", features = ["bundled"] }
 r2d2 = "*"
@@ -22,3 +23,6 @@ uuid = { version = "*", features = ["v4"]}
 chrono = {version="*", features=["serde"]}
 obelisk = {path="./obelisk"}
 obelisk_deployment = {package="deployment", path="./obelisk/deployment"}
+
+[dev-dependencies]
+csv = "*"

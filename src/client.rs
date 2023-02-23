@@ -1,4 +1,4 @@
-use crate::btree::{BTreeReqMeta, BTreeRespMeta};
+use crate::btree::{BTreeReqMeta, BTreeRespMeta, RescalingOp};
 use crate::global_ownership::GlobalOwnership;
 use std::collections::HashMap;
 use std::sync::{atomic, Arc};
@@ -8,7 +8,7 @@ use std::sync::{atomic, Arc};
 #[derive(Clone)]
 pub struct BTreeClient {
     num_reqs: Arc<atomic::AtomicUsize>,
-    global_ownership: Arc<GlobalOwnership>,
+    pub global_ownership: Arc<GlobalOwnership>,
 }
 
 impl BTreeClient {
@@ -32,26 +32,21 @@ impl BTreeClient {
         let mut try_cache = true;
         let req_meta = serde_json::to_string(&req_meta).unwrap();
         let curr_num_reqs = self.num_reqs.fetch_add(1, atomic::Ordering::AcqRel);
-        // Send a manage request every 10 requests.
-        if curr_num_reqs % 10 == 0 {
-            // Reset to 1 to prevent perpetual reset to 0 (because 0%10 == 0).
+        // Send a manage request every N requests.
+        if curr_num_reqs % 100 == 0 {
+            // Reset to 1 to prevent perpetual reset to 0 (because 0%N == 0).
             self.num_reqs.store(1, atomic::Ordering::Release);
             let global_ownership = self.global_ownership.clone();
             tokio::spawn(async move {
                 let mc = global_ownership.get_or_make_client("manager").await;
                 let req_meta = BTreeReqMeta::Manage;
                 let req_meta = serde_json::to_string(&req_meta).unwrap();
-                loop {
-                    let resp = mc.send_message(&req_meta, &[]).await;
-                    if resp.is_some() {
-                        break;
-                    }
-                }
+                let _resp = mc.send_message(&req_meta, &[]).await;
             });
         }
         loop {
             // Get current owner.
-            let (_ownership_key, owner_id) =
+            let (ownership_key, owner_id) =
                 match self.global_ownership.find_owner(key, try_cache).await {
                     Some(x) => x,
                     None => {
@@ -69,18 +64,31 @@ impl BTreeClient {
                 if let Some((resp_meta, resp_payload)) = resp {
                     let resp_meta: BTreeRespMeta = serde_json::from_str(&resp_meta).unwrap();
                     break (resp_meta, resp_payload);
+                } else {
+                    // Change later.
+                    println!("Unable to send messaging. Exiting for test!");
+                    std::process::exit(1);
                 }
             };
             // If bad owner, retry without cache.
             match &resp_meta {
                 BTreeRespMeta::BadOwner => {
+                    println!("Owner ({owner_id}, {ownership_key}) is wrong owner");
+                    if !try_cache {
+                        println!("Remove after testing");
+                        std::process::exit(1);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     try_cache = false;
                     continue;
                 }
                 BTreeRespMeta::InvariantIssue => {
                     panic!("BTree Invariant issues!");
                 }
-                _ => break (resp_meta, resp_payload),
+                _ => {
+                    println!("Got response from {owner_id}: {resp_meta:?}");
+                    break (resp_meta, resp_payload);
+                }
             }
         }
     }
@@ -135,26 +143,19 @@ impl BTreeClient {
             }
         }
         println!("Done scaling in for cleanup!");
-        // Delete all in manager.
         let req_meta = BTreeReqMeta::Cleanup { worker: None };
         let req_meta = serde_json::to_string(&req_meta).unwrap();
         println!("Completing cleanup on manager!");
-        loop {
-            let resp = manager_mc.send_message(&req_meta, &[]).await;
-            match resp {
-                None => continue,
-                Some((resp_meta, _)) => {
-                    let resp_meta: BTreeRespMeta = serde_json::from_str(&resp_meta).unwrap();
-                    match resp_meta {
-                        BTreeRespMeta::Ok => break,
-                        _ => {
-                            panic!("Should be ok");
-                        }
-                    }
-                }
+        let (resp_meta, _) = manager_mc.send_message(&req_meta, &[]).await.unwrap();
+        let resp_meta: BTreeRespMeta = serde_json::from_str(&resp_meta).unwrap();
+        match resp_meta {
+            BTreeRespMeta::Ok => {}
+            _ => {
+                panic!("Should be ok");
             }
         }
         println!("Done completing cleaning up");
+        self.global_ownership.refresh_ownership_keys().await;
     }
 
     /// Put key/value pair.
@@ -162,7 +163,7 @@ impl BTreeClient {
         let req_meta = BTreeReqMeta::Put { key: key.into() };
         let (resp_meta, _resp_payload) = self.send_to_owner(key, req_meta, value).await;
         match &resp_meta {
-            BTreeRespMeta::Ok => {},
+            BTreeRespMeta::Ok => {}
             _ => {
                 panic!("Unknown response: {resp_meta:?}");
             }
@@ -188,8 +189,8 @@ impl BTreeClient {
         let req_meta = BTreeReqMeta::Delete { key: key.into() };
         let (resp_meta, _resp_payload) = self.send_to_owner(key, req_meta, vec![]).await;
         match &resp_meta {
-            BTreeRespMeta::Ok => {},
-            BTreeRespMeta::NotFound => {},
+            BTreeRespMeta::Ok => {}
+            BTreeRespMeta::NotFound => {}
             _ => {
                 panic!("Unknown response: {resp_meta:?}");
             }
@@ -206,9 +207,7 @@ impl BTreeClient {
                 let (_ownership_key, owner_id) =
                     match self.global_ownership.find_owner(&key, true).await {
                         Some(x) => x,
-                        None => {
-                            self.global_ownership.find_owner(&key, false).await.unwrap()
-                        }
+                        None => self.global_ownership.find_owner(&key, false).await.unwrap(),
                     };
                 if !msgs.contains_key(&owner_id) {
                     msgs.insert(owner_id.clone(), Vec::new());
@@ -221,9 +220,8 @@ impl BTreeClient {
                 let global_ownership = self.global_ownership.clone();
                 ts.push(tokio::spawn(async move {
                     let mc = global_ownership.get_or_make_client(&owner_id).await;
-                    let payload = tokio::task::block_in_place(move || {
-                        bincode::serialize(&msgs).unwrap()
-                    });
+                    let payload =
+                        tokio::task::block_in_place(move || bincode::serialize(&msgs).unwrap());
                     let req_meta = BTreeReqMeta::Load;
                     let req_meta = serde_json::to_string(&req_meta).unwrap();
                     let not_owned = loop {
@@ -232,14 +230,14 @@ impl BTreeClient {
                             None => {
                                 println!("Load. Could not send message!");
                                 std::process::exit(1);
-                            },
+                            }
                             Some((_, payload)) => {
-                                let not_owned: Vec<(String, Vec<u8>)> = tokio::task::block_in_place(move || {
-                                    bincode::deserialize(&payload).unwrap()
-                                });
+                                let not_owned: Vec<(String, Vec<u8>)> =
+                                    tokio::task::block_in_place(move || {
+                                        bincode::deserialize(&payload).unwrap()
+                                    });
                                 break not_owned;
-                            },
-                            
+                            }
                         }
                     };
                     not_owned
@@ -259,7 +257,7 @@ impl BTreeClient {
                 println!("Exiting for test. Remove this block of code later!!!");
                 std::process::exit(1);
             }
-        } 
+        }
     }
 
     pub async fn unload(&self, mut keys: Vec<String>) {
@@ -271,9 +269,7 @@ impl BTreeClient {
                 let (_ownership_key, owner_id) =
                     match self.global_ownership.find_owner(&key, true).await {
                         Some(x) => x,
-                        None => {
-                            self.global_ownership.find_owner(&key, false).await.unwrap()
-                        }
+                        None => self.global_ownership.find_owner(&key, false).await.unwrap(),
                     };
                 if !msgs.contains_key(&owner_id) {
                     msgs.insert(owner_id.clone(), Vec::new());
@@ -286,25 +282,24 @@ impl BTreeClient {
                 let global_ownership = self.global_ownership.clone();
                 ts.push(tokio::spawn(async move {
                     let mc = global_ownership.get_or_make_client(&owner_id).await;
-                    let payload = tokio::task::block_in_place(move || {
-                        bincode::serialize(&msgs).unwrap()
-                    });
-                    let req_meta = BTreeReqMeta::Load;
+                    let payload =
+                        tokio::task::block_in_place(move || bincode::serialize(&msgs).unwrap());
+                    let req_meta = BTreeReqMeta::Unload;
                     let req_meta = serde_json::to_string(&req_meta).unwrap();
                     let not_owned = loop {
                         let resp = mc.send_message(&req_meta, &payload).await;
                         match resp {
                             None => {
-                                println!("Load. Could not send message!");
+                                println!("Unload. Could not send message!");
                                 std::process::exit(1);
-                            },
+                            }
                             Some((_, payload)) => {
-                                let not_owned: Vec<String> = tokio::task::block_in_place(move || {
-                                    bincode::deserialize(&payload).unwrap()
-                                });
+                                let not_owned: Vec<String> =
+                                    tokio::task::block_in_place(move || {
+                                        bincode::deserialize(&payload).unwrap()
+                                    });
                                 break not_owned;
-                            },
-                            
+                            }
                         }
                     };
                     not_owned
@@ -323,6 +318,26 @@ impl BTreeClient {
             if !keys.is_empty() {
                 println!("Exiting for test. Remove this block of code later!!!");
                 std::process::exit(1);
+            }
+        }
+    }
+
+    /// Forcibly rescale.
+    pub async fn force_rescale(&self, op: Option<RescalingOp>) {
+        let manager_mc = self.global_ownership.get_or_make_client("manager").await;
+        println!("Spinning up manager");
+        manager_mc.spin_up().await;
+        println!("Done spinning up manager");
+        let req_meta = BTreeReqMeta::ForceRescale { op };
+        let req_meta = serde_json::to_string(&req_meta).unwrap();
+        println!("Sending force rescale to manager: {req_meta:?}!");
+        let (resp_meta, _) = manager_mc.send_message(&req_meta, &[]).await.unwrap();
+        let resp_meta: BTreeRespMeta = serde_json::from_str(&resp_meta).unwrap();
+        println!("Done sending force rescale to manager: {resp_meta:?}");
+        match resp_meta {
+            BTreeRespMeta::Ok => {}
+            _ => {
+                panic!("Should be ok");
             }
         }
     }
