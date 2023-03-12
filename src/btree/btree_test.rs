@@ -5,6 +5,7 @@ mod tests {
         BTreeClient,
     };
     use obelisk::{ActorInstance, FunctionalClient, MessagingClient, PersistentLog};
+    use rand::distributions::Distribution;
     use std::{collections::BTreeMap, sync::Arc};
 
     use crate::BTreeActor;
@@ -82,7 +83,7 @@ mod tests {
     async fn run_simple_test() {
         // Make btree actor.
         let name = "manager";
-        let plog = PersistentLog::new("sbtree", name).await;
+        let plog = PersistentLog::new("sbtree", name).await.unwrap();
         let btree_actor = BTreeActor::new(name, Arc::new(plog)).await;
         // The empty key always maps to the empty value.
         let (resp_meta, value) = btree_actor.get("").await;
@@ -137,7 +138,7 @@ mod tests {
     async fn run_leaf_split_merge_test(insert_size_kb: usize, force_checkpoint: bool) {
         // Make btree actor.
         let name = "manager";
-        let plog = PersistentLog::new("sbtree", name).await;
+        let plog = PersistentLog::new("sbtree", name).await.unwrap();
         let btree_actor = BTreeActor::new(name, Arc::new(plog)).await;
         // Insert values.
         assert!(insert_size_kb <= 10000); // Higher could lead to root split.
@@ -249,7 +250,7 @@ mod tests {
     ) {
         // Make btree actor.
         let name = "manager";
-        let plog = PersistentLog::new("sbtree", name).await;
+        let plog = PersistentLog::new("sbtree", name).await.unwrap();
         let btree_actor = BTreeActor::new(name, Arc::new(plog)).await;
         let num_inserts = (1024 * insert_size_mb) / val_size_kb; // Enough inserts to fill mbs.
         let start_time = std::time::Instant::now();
@@ -554,175 +555,12 @@ mod tests {
         btree_client.cleanup().await;
     }
 
-    async fn write_bench_output(points: Vec<(u64, f64, f64, f64)>, expt_name: &str) {
-        let expt_dir = "results/bench";
-        std::fs::create_dir_all(expt_dir).unwrap();
-        let mut writer = csv::WriterBuilder::new()
-            .from_path(format!("{expt_dir}/{expt_name}.csv"))
-            .unwrap();
-        for (since, get_duration, put_duration, active_duration) in points {
-            writer
-                .write_record(&[
-                    since.to_string(),
-                    get_duration.to_string(),
-                    put_duration.to_string(),
-                    active_duration.to_string(),
-                ])
-                .unwrap();
-        }
-        writer.flush().unwrap();
-    }
-
-    /// Benchmarking regime.
-    #[derive(Debug)]
-    enum RequestRate {
-        Low,    // 5%.
-        Medium, // 50%.
-        High,   // 100%.
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn simple_bench_test() {
-        // run_simple_bench_test(true, false, "simple").await;
-        run_simple_bench_test("simple", RequestRate::High).await;
-    }
-
-    /// Takes ~35 minutes to run to completion.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn variable_bench_test() {
-        run_simple_bench_test("pre", RequestRate::Low).await;
-        run_simple_bench_test("pre", RequestRate::Medium).await;
-        run_simple_bench_test("mid", RequestRate::High).await;
-        run_simple_bench_test("post", RequestRate::Medium).await;
-        run_simple_bench_test("post", RequestRate::Low).await;
-    }
-
-    async fn run_simple_bench_test(prefix: &str, rate: RequestRate) {
-        // Cleanup all data.
-        let btree_client = BTreeClient::new().await;
-        btree_client.cleanup().await;
-        // Put on value
-        btree_client.put("Amadou", b"Ngom".to_vec()).await;
-        // Run bench.
-        let fc = FunctionalClient::new("sbtree").await;
-        let (activity, num_workers) = match rate {
-            RequestRate::Low => (0.05, 1),
-            RequestRate::Medium => (0.5, 1),
-            RequestRate::High => (1.0, 1),
-        };
-        let test_duration = std::time::Duration::from_secs(10 * 60);
-        let mut workers = Vec::new();
-        for n in 0..num_workers {
-            let fc = fc.clone();
-            let test_duration = test_duration.clone();
-            workers.push(tokio::spawn(async move {
-                let mut results: Vec<(u64, f64, f64, f64)> = Vec::new();
-                let start_time = std::time::Instant::now();
-                loop {
-                    let curr_time = std::time::Instant::now();
-                    let since = curr_time.duration_since(start_time);
-                    if since > test_duration {
-                        break;
-                    }
-                    let since = since.as_millis() as u64;
-                    let mut ops = Vec::new();
-                    for i in 0..5 {
-                        if i == 2 {
-                            // ops.push(crate::bench_fn::BenchOp::Put {
-                            //     key: "Amadou".into(),
-                            //     value: b"Ngom".to_vec(),
-                            //     dynamo: false,
-                            // });
-                            ops.push(crate::bench_fn::BenchOp::Get {
-                                key: "Amadou".into(),
-                                dynamo: false,
-                            });
-                        } else {
-                            ops.push(crate::bench_fn::BenchOp::Get {
-                                key: "Amadou".into(),
-                                dynamo: false,
-                            });
-                        }
-                    }
-                    let ops = serde_json::to_vec(&ops).unwrap();
-                    let start_time = std::time::Instant::now();
-                    let resp = fc.invoke(&ops).await;
-                    if resp.is_err() {
-                        println!("Err: {resp:?}");
-                        continue;
-                    }
-                    let resp = resp.unwrap();
-                    let (get_duration, put_duration): (std::time::Duration, std::time::Duration) =
-                        serde_json::from_value(resp).unwrap();
-                    let end_time = std::time::Instant::now();
-                    let active_time = end_time.duration_since(start_time).as_secs_f64() * 1000.0;
-                    println!("Worker {n} Get Duration: {get_duration:?}");
-                    println!("Worker {n} Put Duration: {put_duration:?}");
-                    println!("Worker {n} Since: {since:?}");
-                    let get_duration = get_duration.as_secs_f64() * 1000.0;
-                    let put_duration = put_duration.as_secs_f64() * 1000.0;
-                    results.push((since, get_duration, put_duration, active_time));
-                    // Time to wait to get desired activity.
-                    let wait_time = active_time / activity - active_time;
-                    if wait_time > 1e-4 {
-                        let wait_time = std::time::Duration::from_millis(wait_time.ceil() as u64);
-                        tokio::time::sleep(wait_time).await;
-                    }
-                }
-                results
-            }));
-        }
-        let mut results: Vec<(u64, f64, f64, f64)> = Vec::new();
-        for w in workers {
-            let mut r = w.await.unwrap();
-            results.append(&mut r);
-        }
-        write_bench_output(results, &format!("{prefix}_{rate:?}")).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn test_gen_data() {
-        // run_simple_bench_test(true, false, "simple").await;
-        reset_for_test().await;
-        let okeys = gen_data(64, 32, 8).await;
-        std::env::set_var("EXECUTION_MODE", "");
-        reset_for_test().await;
-        bulk_load_data(okeys).await;
-        let btree_client = BTreeClient::new().await;
-        let val = btree_client.get("37").await.unwrap();
-        println!("Val Len: {}", val.len());
-    }
-
-    async fn bulk_load_data(okeys: BTreeMap<String, String>) {
-        // Cleanup all data.
-        let btree_client = BTreeClient::new().await;
-        println!("Spinning up manager!");
-        let manager_mc = btree_client
-            .global_ownership
-            .get_or_make_client("manager")
-            .await;
-        println!("Spun up manager!");
-        btree_client.cleanup().await;
-        let okeys: Vec<String> = okeys.keys().cloned().collect();
-        let chunks: Vec<Vec<String>> = okeys.chunks(8).map(|c| c.to_vec()).collect();
-        for chunk in chunks {
-            println!("Bulk loading {okeys:?}");
-            let msg = crate::btree::BTreeReqMeta::BulkLoad { okeys: chunk };
-            let msg = serde_json::to_string(&msg).unwrap();
-            manager_mc.send_message(&msg, &[]).await;
-            println!("Bulk loaded {okeys:?}");
-        }
-    }
-
-    async fn gen_data(
+    async fn gen_local_data(
+        btree_actor: &BTreeActor,
         insert_size_mb: usize,
         val_size_kb: usize,
         parallelism: usize,
-    ) -> BTreeMap<String, String> {
-        // Make btree actor.
-        let name = "manager";
-        let plog = PersistentLog::new("sbtree", name).await;
-        let btree_actor = BTreeActor::new(name, Arc::new(plog)).await;
+    ) {
         let num_inserts = (1024 * insert_size_mb) / val_size_kb; // Enough inserts to fill mbs.
         let start_time = std::time::Instant::now();
         // First do sequential inserts to create enough parallelism.
@@ -761,6 +599,18 @@ mod tests {
         let duration = end_time.duration_since(start_time);
         println!("Parallel Insert Duration: {duration:?}");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
+    async fn gen_data(
+        insert_size_mb: usize,
+        val_size_kb: usize,
+        parallelism: usize,
+    ) -> BTreeMap<String, String> {
+        // Make btree actor.
+        let name = "manager";
+        let plog = PersistentLog::new("sbtree", name).await.unwrap();
+        let btree_actor = BTreeActor::new(name, Arc::new(plog)).await;
+        gen_local_data(&btree_actor, insert_size_mb, val_size_kb, parallelism).await;
         let all_ownership_keys = btree_actor
             .tree_structure
             .global_ownership
@@ -808,5 +658,134 @@ mod tests {
             t.await.unwrap();
         }
         all_ownership_keys
+    }
+
+    async fn init_bench_test(bc: Arc<BTreeClient>) {
+        println!("Generating data");
+        reset_for_test().await;
+        let okeys = gen_data(8, 1, 8).await;
+        std::env::set_var("EXECUTION_MODE", "");
+        reset_for_test().await;
+        println!("Bulk Loading data");
+        bulk_load_data(bc.clone(), okeys).await;
+        let val = bc.get("37").await.unwrap();
+        println!("Val Len: {}", val.len());
+    }
+
+    async fn bulk_load_data(bc: Arc<BTreeClient>, okeys: BTreeMap<String, String>) {
+        // Cleanup all data.
+        bc.cleanup().await;
+        let manager_mc = bc.global_ownership.get_or_make_client("manager").await;
+        let okeys: Vec<String> = okeys.keys().cloned().collect();
+        let chunks: Vec<Vec<String>> = okeys.chunks(8).map(|c| c.to_vec()).collect();
+        for chunk in chunks {
+            println!("Bulk loading {okeys:?}");
+            let msg = crate::btree::BTreeReqMeta::BulkLoad { okeys: chunk };
+            let msg = serde_json::to_string(&msg).unwrap();
+            let mut bulk_loaded = false;
+            for _ in 0..3 {
+                let resp = manager_mc.send_message(&msg, &[]).await;
+                bulk_loaded = resp.is_some();
+                if bulk_loaded {
+                    break;
+                }
+            }
+            if !bulk_loaded {
+                panic!("Could not bulk load!");
+            }
+            println!("Bulk loaded {okeys:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn test_gen_data() {
+        let bc = Arc::new(BTreeClient::new().await);
+        init_bench_test(bc.clone()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn rescaling_logic_test() {
+        println!("Resetting for test!");
+        reset_for_test().await;
+        let insert_size_mb = 16384;
+        let val_size_kb = 16;
+        let parallism = 8;
+        let num_inserts = (insert_size_mb * 1024) / val_size_kb;
+
+        // Make btree actor.
+        let memory_mb: usize = 4096;
+        std::env::set_var("MEMORY", memory_mb.to_string());
+        std::env::set_var("EXECUTION_MODE", "local");
+        let name = "manager";
+        let plog = PersistentLog::new("sbtree", name).await.unwrap();
+        let btree_actor = BTreeActor::new(name, Arc::new(plog)).await;
+        gen_local_data(&btree_actor, insert_size_mb, val_size_kb, parallism).await;
+
+        // Check stats.
+        let stats = btree_actor
+            .tree_structure
+            .block_cache
+            .retrieve_stats()
+            .await;
+        println!("Stats before reset: {stats}");
+        let stats = btree_actor.tree_structure.block_cache.reset_stats().await;
+        println!("Reset stats: {stats}");
+        // println!("Sleeping 20s");
+        // tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        // let stats = btree_actor.tree_structure.block_cache.retrieve_stats().await;
+        // println!("Current stats: {stats}");
+        // // Make cached accesses.
+        // let start_time = std::time::Instant::now();
+        // println!("Performing Cached Accesses");
+        // loop {
+        //     let curr_time = std::time::Instant::now();
+        //     let since = curr_time.duration_since(start_time).as_secs();
+        //     if since > 20 {
+        //         break;
+        //     }
+        //     let key: usize = 1;
+        //     for _ in 0..1000 {
+        //         let _ = btree_actor.get(&key.to_string()).await;
+        //     }
+        //     let end_time = std::time::Instant::now();
+        //     let duration = end_time.duration_since(curr_time).as_secs_f64();
+        //     if duration >= 1.0 {
+        //         continue;
+        //     } else {
+        //         let sleep_duration = 1.0 - duration;
+        //         tokio::time::sleep(std::time::Duration::from_secs_f64(sleep_duration)).await;
+        //     }
+        // }
+        // let stats = btree_actor.tree_structure.block_cache.retrieve_stats().await;
+        // println!("Current stats: {stats}");
+
+        // Make cached accesses.
+        let start_time = std::time::Instant::now();
+        println!("Performing Uncached Accesses");
+        let mut rng = rand::thread_rng();
+        let zipf = zipf::ZipfDistribution::new(num_inserts, 1.0).unwrap();
+
+        loop {
+            let curr_time = std::time::Instant::now();
+            let since = curr_time.duration_since(start_time).as_secs();
+            if since > 20 {
+                break;
+            }
+            // Most of these keys should be in different blocks.
+            for _ in 0..100000 {
+                let key = zipf.sample(&mut rng);
+                let key: usize = key;
+                if key == 0 {
+                    println!("Saw 0.")
+                }
+                let _ = btree_actor.get(&key.to_string()).await;
+            }
+        }
+        let stats = btree_actor
+            .tree_structure
+            .block_cache
+            .retrieve_stats()
+            .await;
+        println!("Current stats: {stats}");
     }
 }

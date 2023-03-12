@@ -905,19 +905,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dashmap"
-version = "5.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "907076dfda823b0b36d2a1bb5f90c96660a5bbcd7729e10727f07858f22c4edc"
-dependencies = [
- "cfg-if",
- "hashbrown 0.12.3",
- "lock_api",
- "once_cell",
- "parking_lot_core",
-]
-
-[[package]]
 name = "deployment"
 version = "0.1.0"
 dependencies = [
@@ -1998,17 +1985,18 @@ dependencies = [
  "bincode",
  "chrono",
  "csv",
- "dashmap",
  "deployment",
  "lru",
  "obelisk",
  "r2d2",
  "r2d2_sqlite",
+ "rand",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "uuid",
+ "zipf",
 ]
 
 [[package]]
@@ -2898,3 +2886,12 @@ name = "zeroize"
 version = "1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c394b5bd0c6f669e7275d9c20aa90ae064cb22e75a1cad54e1b34088034b149f"
+
+[[package]]
+name = "zipf"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "835688a7a1b5d2dfaeb5b7e1b4cfb979e7095a70cd1c72fe083f4904ef3e995e"
+dependencies = [
+ "rand",
+]

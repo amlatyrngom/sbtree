@@ -25,11 +25,15 @@ impl LocalOwnership {
                     continue;
                 }
             };
+            let start_time = std::time::Instant::now();
             let resp = conn.query_row(
                 "SELECT data FROM blocks WHERE block_id=?",
                 [block_id],
                 |row| row.get(0),
             );
+            let end_time = std::time::Instant::now();
+            let duration = end_time.duration_since(start_time);
+            println!("Fetch block duration: {duration:?}");
             match resp {
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
                     break None;
@@ -288,6 +292,23 @@ impl LocalOwnership {
                 }
             }
         }
+        // Vacuum.
+        self.vacuum().await;
+    }
+
+    async fn vacuum(&self) {
+        tokio::task::block_in_place(move || {
+            let conn = loop {
+                match self.pool.get() {
+                    Ok(conn) => break conn,
+                    Err(x) => {
+                        println!("MoveBlocks: {x:?}");
+                        continue;
+                    }
+                };
+            };
+            let _resp = conn.execute("VACUUM", []);
+        });
     }
 
     /// Release lock on file.
@@ -332,14 +353,18 @@ impl LocalOwnership {
     /// Delete database.
     pub async fn delete(self) {
         let db_file = self.db_file.clone();
+        println!("Deleting file: {db_file}");
         std::mem::drop(self);
-        tokio::task::block_in_place(move || loop {
+        tokio::task::block_in_place(move || {
             let resp = std::fs::remove_file(db_file.clone());
             match resp {
                 Ok(_) => return,
                 Err(err) => match err.kind() {
                     std::io::ErrorKind::NotFound => return,
-                    _ => continue,
+                    _ => {
+                        println!("Error: {err:?}");
+                        std::process::exit(1);
+                    }
                 },
             }
         })
@@ -373,42 +398,42 @@ impl LocalOwnership {
             let pool = match r2d2::Pool::builder().max_size(1).build(manager) {
                 Ok(pool) => pool,
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             };
             let mut conn = match pool.get() {
                 Ok(conn) => conn,
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             };
             match conn.pragma_update(None, "locking_mode", "exclusive") {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             }
-            match conn.pragma_update(None, "journal_mode", "ps") {
+            match conn.pragma_update(None, "journal_mode", "wal") {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             }
             let txn = match conn.transaction() {
                 Ok(txn) => txn,
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             };
             match txn.execute("CREATE TABLE IF NOT EXISTS incarnation (unique_row INTEGER PRIMARY KEY, incarnation_num INT)", ()) {
                 Ok(_) => {},
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             }
@@ -418,7 +443,7 @@ impl LocalOwnership {
             ) {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             }
@@ -431,7 +456,7 @@ impl LocalOwnership {
             ) {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("NewLocalOwnership: {x:?}");
+                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
                     continue;
                 }
             };

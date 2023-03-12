@@ -9,6 +9,12 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 pub const TARGET_LEAF_SIZE: usize = 1 << 18;
 /// Number of inner node children. Ideally scaling unit size should be 32MB-64MB, with ~50MB the average.
 pub const TARGET_INNER_LENGTH: usize = 256;
+/// Moving average
+pub const MOVING_FACTOR: f64 = 0.25;
+/// ECS Base Cost.
+pub const ECS_BASE_COST: f64 = 0.015;
+/// Number of milliseconds gained for each cache access.
+pub const CACHE_GAIN_MS: f64 = 15.0;
 /// Reference to a block
 pub type TreeBlockRef = Arc<RwLock<TreeBlock>>;
 
@@ -34,8 +40,8 @@ pub struct TreeBlock {
 pub struct BlockCache {
     transfer: Arc<Mutex<Transfer>>,
     inner: Arc<Mutex<BlockCacheInner>>,
-    _total_mem: usize,
-    accessed_blocks: dashmap::DashSet<String>,
+    total_mem: usize,
+    vcpus: f64,
     stats: Arc<Mutex<BlockCacheStats>>,
     local_ownership: Arc<RwLock<HashMap<String, LocalOwnership>>>,
 }
@@ -51,7 +57,10 @@ struct BlockCacheInner {
 
 /// Statistics about block cache.
 struct BlockCacheStats {
-    load: f64,
+    loss: f64,
+    gain: f64,
+    miss_count: usize,
+    access_count: usize,
     time: std::time::Instant,
 }
 
@@ -72,9 +81,17 @@ impl BlockCache {
             ongoing_writes_queue: HashMap::new(),
         }));
         let total_mem = std::env::var("MEMORY").unwrap_or_else(|_| "1".into());
-        let total_mem: usize = total_mem.parse().unwrap();
-        // 80% of available memory. Rest should be for pinned stuff and for other data structures.
-        let total_mem = (total_mem * (1024 * 1024) * 80) / 100;
+        let mut total_mem: usize = total_mem.parse().unwrap();
+        let vcpus: f64 = (total_mem as f64) / 2048.0;
+        // 512MB seems to be the amount of memory used as a baseline.
+        if total_mem > 512 {
+            total_mem -= 512;
+        }
+        // 90% of available memory. Rest should be for pinned stuff and for other data structures.
+        total_mem = (total_mem * (1024 * 1024) * 90) / 100;
+        if !obelisk::common::has_external_access() {
+            total_mem /= 4;
+        }
         // Inner.
         let inner = Arc::new(Mutex::new(BlockCacheInner {
             avail_space: total_mem,
@@ -85,8 +102,11 @@ impl BlockCache {
         }));
         // Stats.
         let stats = Arc::new(Mutex::new(BlockCacheStats {
-            load: 1.0,
             time: std::time::Instant::now(),
+            miss_count: 0,
+            access_count: 0,
+            gain: 1.0,
+            loss: 0.5,
         }));
         // Make object.
         BlockCache {
@@ -94,8 +114,8 @@ impl BlockCache {
             transfer,
             inner,
             stats,
-            _total_mem: total_mem,
-            accessed_blocks: dashmap::DashSet::new(),
+            total_mem,
+            vcpus,
         }
     }
 
@@ -175,48 +195,67 @@ impl BlockCache {
     }
 
     /// Reset load.
-    pub async fn reset_load(&self) -> f64 {
+    pub async fn reset_stats(&self) -> String {
         let mut stats = self.stats.lock().await;
-        self.accessed_blocks.clear();
+        stats.miss_count = 0;
+        stats.access_count = 0;
+        stats.gain = 1.0; // Prevent sudden scale downs.
+        stats.loss = 0.5; // Prevent sudden scale ups.
         stats.time = std::time::Instant::now();
-        stats.load = if stats.load < 0.5 {
-            stats.load * 2.0
-        } else {
-            1.0
-        };
-        stats.load
+        let stats = (stats.gain, stats.loss);
+        let stats = serde_json::to_string(&stats).unwrap();
+        stats
     }
 
     /// Retrieve load.
-    /// This measure indicates that if the working set is stable, it should be fully cached.
-    pub async fn retrieve_load(&self) -> f64 {
+    pub async fn retrieve_stats(&self) -> String {
         // Compute new load every 1 minute.
         let mut stats = self.stats.lock().await;
         let curr_time = std::time::Instant::now();
         let since = curr_time.duration_since(stats.time);
-        if since < std::time::Duration::from_secs(60) {
-            return stats.load;
+        if since > std::time::Duration::from_secs(20) {
+            let (new_gain, new_loss) = if obelisk::common::has_external_access() {
+                let lambda_cost = 0.0000000083 * CACHE_GAIN_MS; // Cost of 512MB.
+                let access_per_sec = (stats.access_count as f64) / since.as_secs_f64();
+                let miss_per_sec = (stats.miss_count as f64) / since.as_secs_f64();
+                println!(
+                    "Retrieving stats. AccessPerSec={access_per_sec}; MissPerSec={miss_per_sec}"
+                );
+                // How much could maximally be lost if scaled down.
+                let vcpus = if self.vcpus < 1.0 {
+                    // Test environment.
+                    2.0
+                } else {
+                    self.vcpus
+                };
+                let new_gain = (access_per_sec * lambda_cost) / (vcpus * ECS_BASE_COST / 3600.0);
+                // How much is lost due to cache misses.
+                let new_loss = (miss_per_sec * lambda_cost) / (vcpus * ECS_BASE_COST / 3600.0);
+                println!("Retrieving stats. NewGain={new_gain}; NewLoss={new_loss}");
+                (new_gain, new_loss)
+            } else {
+                (1.0, 0.5)
+            };
+            // Moving average.
+            stats.gain = (1.0 - MOVING_FACTOR) * stats.gain + MOVING_FACTOR * new_gain;
+            stats.loss = (1.0 - MOVING_FACTOR) * stats.loss + MOVING_FACTOR * new_loss;
+            stats.access_count = 0;
+            stats.miss_count = 0;
+            stats.time = curr_time;
         }
-        // Estimate accessed size and reset set of accessed blocks.
-        let access_size = (self.accessed_blocks.len() * TARGET_LEAF_SIZE) as f64;
-        self.accessed_blocks.clear();
-        // Compute load. Access / 1GB.
-        stats.load = access_size / (1.0 * 1024.0 * 1024.0);
-        if !obelisk::common::has_external_access() {
-            // Should never scale out while the actor is a lambda.
-            // Likewise, should only scale in under very low activity.
-            // This is because low load is likely due to the high messaging latency.
-            if stats.load > 1.0 || stats.load < 0.1 {
-                stats.load = 1.0;
-            }
-        }
-        stats.time = curr_time;
-        stats.load
+        let stats = (stats.gain, stats.loss);
+        let stats = serde_json::to_string(&stats).unwrap();
+        stats
     }
 
-    /// Record access to a block of data.
-    fn record_access(&self, block_id: &str) {
-        self.accessed_blocks.insert(block_id.into());
+    async fn record_access(&self, fetched: bool) {
+        let mut stats = self.stats.lock().await;
+        if fetched {
+            // When fetched, access is already counted.
+            stats.miss_count += 1;
+        } else {
+            stats.access_count += 1;
+        }
     }
 
     /// Get or insert a block from the block cache.
@@ -226,6 +265,7 @@ impl BlockCache {
         tree_block: Option<TreeBlock>,
     ) -> Option<Arc<RwLock<TreeBlock>>> {
         let mut inner = self.inner.lock().await;
+        self.record_access(tree_block.is_some()).await;
         match inner.pinned.get(block_id).cloned() {
             None => match inner.unpinned.remove(block_id) {
                 None => match tree_block {
@@ -274,7 +314,6 @@ impl BlockCache {
         force_fetch: bool,
     ) -> (Option<Arc<RwLock<TreeBlock>>>, bool) {
         // Return if already cached.
-        self.record_access(block_id);
         if !force_fetch {
             let block = self.get_or_insert(block_id, None).await;
             if block.is_some() {
@@ -297,10 +336,12 @@ impl BlockCache {
         let db = self.get_or_make_db(ownership_key).await;
         let block = match db.fetch_raw_block(block_id).await {
             None => None,
-            Some(block) => tokio::task::block_in_place(move || {
+            Some(block) => tokio::task::spawn_blocking(move || {
                 let block = bincode::deserialize(&block).unwrap();
                 Some(block)
-            }),
+            })
+            .await
+            .unwrap(),
         };
 
         // Insert in cache.
@@ -495,9 +536,11 @@ impl BlockCache {
                     Self::wait_for_write_turn(transfer.clone(), &block_id, write_version).await;
                 if can_write {
                     // Serialize.
-                    let data = tokio::task::block_in_place(move || {
+                    let data = tokio::task::spawn_blocking(move || {
                         bincode::serialize(&tree_block).unwrap()
-                    });
+                    })
+                    .await
+                    .unwrap();
                     // Write.
                     db.write_block(&block_id, data).await;
                     // Delete version from queue.
@@ -537,6 +580,25 @@ impl BlockCache {
                 inner.unpinned.insert(block_id.into(), block.clone());
                 inner.unpinned_lru.put(block_id.into(), ());
             }
+        }
+    }
+
+    /// Clear block cache. Use for bulk loading.
+    pub async fn clear(&self) {
+        self.reset_stats().await;
+        {
+            // Clear pin/unpin state.
+            let mut inner = self.inner.lock().await;
+            inner.pinned.clear();
+            inner.pincounts.clear();
+            inner.unpinned.clear();
+            inner.unpinned_lru.clear();
+            inner.avail_space = self.total_mem;
+        }
+        {
+            // Clear local ownership.
+            let mut local_ownership = self.local_ownership.write().await;
+            local_ownership.clear();
         }
     }
 }

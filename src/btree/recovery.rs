@@ -80,9 +80,9 @@ impl Recovery {
             }
             // Also Wait until all async writes are over.
             if done {
-                println!("Recovery::recovery_flusher(). Done waiting for signal.");
                 let no_ongoing_write = recovery_lock.try_write().is_ok();
                 if no_ongoing_write {
+                    println!("Recovery::recovery_flusher(). Done waiting for signal.");
                     return;
                 }
             }
@@ -568,15 +568,11 @@ impl Recovery {
     pub async fn write_log_entry(plog: Arc<PersistentLog>, log_entry: BTreeLogEntry) -> usize {
         let log_entry = bincode::serialize(&log_entry).unwrap();
         let lsn = plog.enqueue(log_entry).await;
-        loop {
-            // Hacky. Use condition variables instead.
-            // Since the flush interval is >=1 milliseconds, waiting <1ms is not a big deal.
-            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-            let flush_lsn = plog.get_flush_lsn().await;
-            if flush_lsn >= lsn {
-                break;
-            }
-        }
+        // let start_time = std::time::Instant::now();
+        plog.flush_at(Some(lsn)).await;
+        // let end_time = std::time::Instant::now();
+        // let duration = end_time.duration_since(start_time);
+        // println!("Recovery::write_log_entry() flush duration: {duration:?}");
         lsn
     }
 

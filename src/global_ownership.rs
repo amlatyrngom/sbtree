@@ -363,10 +363,9 @@ impl GlobalOwnership {
     }
 
     /// Update load.
-    pub async fn update_load(&self, load: f64) {
+    pub async fn update_load(&self, load: String) {
         // First multiply by a 1000 to prevent floating point issues.
         let owner_id = self.owner_id.clone().unwrap();
-        let load = (load * 1000.0).to_string();
         loop {
             let resp = self
                 .dynamo_client
@@ -422,7 +421,7 @@ impl GlobalOwnership {
     }
 
     /// Read loads from persistent store.
-    pub async fn read_loads(&self) -> HashMap<String, f64> {
+    pub async fn read_loads(&self) -> HashMap<String, (f64, f64)> {
         loop {
             let resp = self
                 .dynamo_client
@@ -448,15 +447,14 @@ impl GlobalOwnership {
                         None => break HashMap::new(),
                         Some(items) => items,
                     };
-                    let resp: HashMap<String, f64> = items
+                    let resp: HashMap<String, (f64, f64)> = items
                         .iter()
                         .map(|item| {
                             // Read data.
                             let owner_id = item.get("owner_id").unwrap().as_s().cloned().unwrap();
                             let load = item.get("entry_data").unwrap().as_s().cloned().unwrap();
                             // Parse and divide by 1000 to recover original value.
-                            let load: f64 = load.parse().unwrap();
-                            let load = load / 1000.0;
+                            let load: (f64, f64) = serde_json::from_str(&load).unwrap();
                             (owner_id, load)
                         })
                         .collect();

@@ -12,7 +12,6 @@ serde = {version="*", features = ["derive"]}
 bincode = "*"
 base64 = "0.21.0"
 lru = "*"
-dashmap = "*"
 aws-sdk-dynamodb = "*"
 aws-sdk-s3 = "*"
 aws-config = "*"
@@ -26,3 +25,5 @@ obelisk_deployment = {package="deployment", path="./obelisk/deployment"}
 
 [dev-dependencies]
 csv = "*"
+rand = "*"
+zipf = "*"

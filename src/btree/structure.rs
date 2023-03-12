@@ -38,6 +38,7 @@ pub struct BTreeStructure {
     pub ownership: WorkerOwnership,
     pub running_state: Arc<RwLock<RunningState>>, // RwLock only because of async.
     pub ownership_change_lock: Arc<RwLock<()>>,   // RwLock only because of async.
+    s3_client: aws_sdk_s3::Client,
 }
 
 impl BTreeStructure {
@@ -54,6 +55,8 @@ impl BTreeStructure {
                 .collect(),
         ));
         let running_state = Arc::new(RwLock::new(RunningState::new(plog.clone(), true, 1, "")));
+        let shared_config = aws_config::load_from_env().await;
+        let s3_client = aws_sdk_s3::Client::new(&shared_config); // Should be cached.
         BTreeStructure {
             owner_id: owner_id.into(),
             block_cache,
@@ -62,6 +65,7 @@ impl BTreeStructure {
             ownership,
             running_state,
             ownership_change_lock: Arc::new(RwLock::new(())),
+            s3_client,
         }
     }
 
@@ -114,7 +118,7 @@ impl BTreeStructure {
         }
         // If target of ownership change, mark self as active.
         if to_owner == self.owner_id {
-            let new_load = self.block_cache.reset_load().await;
+            let new_load = self.block_cache.reset_stats().await;
             self.global_ownership.update_load(new_load).await;
             let this = self.clone();
             this.fetch_new_ownership(true).await; // Lock already held.
@@ -189,7 +193,7 @@ impl BTreeStructure {
             running_state.is_active = true;
             running_state.last_rescaling_uid = rescaling_uid.into();
             running_state.checkpoint().await;
-            let new_load = self.block_cache.reset_load().await;
+            let new_load = self.block_cache.reset_stats().await;
             self.global_ownership.update_load(new_load).await;
         }
         Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
@@ -205,7 +209,14 @@ impl BTreeStructure {
         shared_lock: OwnedRwLockReadGuard<()>,
         recovery: Option<(usize, usize)>,
     ) -> bool {
+        let start_time = std::time::Instant::now();
         let mut leaf = leaf.write().await;
+        let end_time = std::time::Instant::now();
+        let duration = end_time.duration_since(start_time);
+        println!(
+            "Put(lock({}, {}, {})) duration: {duration:?}",
+            leaf.block_id, key, leaf.total_size
+        );
         let lsn = match &recovery {
             Some((lsn, leaf_version)) => {
                 if leaf.version > *leaf_version {
@@ -227,6 +238,7 @@ impl BTreeStructure {
             let lsn = match recovery {
                 Some((lsn, _)) => lsn,
                 None => {
+                    let start_time = std::time::Instant::now();
                     let log_entry = BTreeLogEntry::Put {
                         ownership_key: ownership_key.into(),
                         key: key.into(),
@@ -235,6 +247,9 @@ impl BTreeStructure {
                         leaf_version,
                     };
                     let lsn = Recovery::write_log_entry(self.plog.clone(), log_entry).await;
+                    let end_time = std::time::Instant::now();
+                    let duration = end_time.duration_since(start_time);
+                    println!("Log duration: {duration:?}");
                     lsn
                 }
             };
@@ -1077,9 +1092,12 @@ impl BTreeStructure {
         }
         // Truncate log up to DeleteAll entry. TODO: Should probably delete lingering dbs too.
         self.plog.truncate(lsn - 1).await.unwrap();
+        let db_dir = LocalOwnership::data_file_from_key("");
+        let _ = tokio::fs::remove_dir_all(&db_dir).await;
         // Reinitialize.
         self.initialize().await;
-        let new_running_state = RunningState::new(self.plog.clone(), true, 1, "");
+        // Setting next_block_id is a hack to allow bulk loading to work. I should come up with a formal technique.
+        let new_running_state = RunningState::new(self.plog.clone(), true, 1000000, "");
         {
             let mut curr_running_state = self.running_state.write().await;
             *curr_running_state = new_running_state;
@@ -1102,12 +1120,11 @@ impl BTreeStructure {
             }
         };
         println!("Bulk load: {okeys:?}");
-        let shared_config = aws_config::load_from_env().await;
-        let s3_client = aws_sdk_s3::Client::new(&shared_config); // Should be cached.
         let mut ts = Vec::new();
+        self.block_cache.clear().await;
         // Go through ownership keys.
         for ownership_key in okeys {
-            let s3_client = s3_client.clone();
+            let s3_client = self.s3_client.clone();
             let block_cache = self.block_cache.clone();
             let global_ownership = self.global_ownership.clone();
             let owner_id = self.owner_id.clone();
@@ -1123,11 +1140,14 @@ impl BTreeStructure {
                     .bucket(&obelisk::common::bucket_name())
                     .key(&s3_key)
                     .send()
-                    .await
-                    .unwrap();
+                    .await;
+                if resp.is_err() {
+                    return;
+                }
+                let resp = resp.unwrap();
                 let body: Vec<u8> = resp.body.collect().await.unwrap().into_bytes().to_vec();
-                println!("Writing to fs: {block_id}. Len={}", body.len());
                 block_cache.remove_ownership_key(ownership_key, true).await;
+                println!("Writing to fs: {block_id}. Len={}", body.len());
                 tokio::fs::write(data_file, body).await.unwrap();
                 global_ownership
                     .add_ownership_key(&owner_id, ownership_key)
@@ -1140,7 +1160,6 @@ impl BTreeStructure {
         for t in ts {
             t.await.unwrap();
         }
-
         Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
     }
 }

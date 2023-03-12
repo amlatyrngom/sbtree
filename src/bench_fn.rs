@@ -46,10 +46,8 @@ impl BenchFn {
     }
 
     pub async fn do_ops(&self, ops: Vec<BenchOp>) -> Value {
-        let mut num_gets = 0.0;
-        let mut num_puts = 0.0;
-        let mut get_duration = std::time::Duration::from_secs(0);
-        let mut put_duration = std::time::Duration::from_secs(0);
+        let mut get_durations = Vec::new();
+        let mut put_durations = Vec::new();
         for op in ops {
             match op {
                 BenchOp::Get { key, dynamo } => {
@@ -71,8 +69,7 @@ impl BenchFn {
                     }
                     let end_time = std::time::Instant::now();
                     let duration = end_time.duration_since(start_time);
-                    get_duration += duration;
-                    num_gets += 1.0;
+                    get_durations.push(duration);
                 }
                 BenchOp::Put { key, value, dynamo } => {
                     let start_time = std::time::Instant::now();
@@ -95,22 +92,11 @@ impl BenchFn {
                     }
                     let end_time = std::time::Instant::now();
                     let duration = end_time.duration_since(start_time);
-                    put_duration += duration;
-                    num_puts += 1.0;
+                    put_durations.push(duration);
                 }
             }
         }
-        get_duration = if num_gets > 0.0 {
-            get_duration.div_f64(num_gets)
-        } else {
-            get_duration
-        };
-        put_duration = if num_puts > 0.0 {
-            put_duration.div_f64(num_puts)
-        } else {
-            put_duration
-        };
-        let resp = (get_duration, put_duration);
+        let resp = (get_durations, put_durations);
         serde_json::to_value(resp).unwrap()
     }
 }

@@ -1,4 +1,5 @@
 mod block;
+mod btree_bench;
 mod btree_test;
 mod local_ownership;
 mod manager;
@@ -150,7 +151,7 @@ impl ActorInstance for BTreeActor {
             BTreeReqMeta::Cleanup { worker } => self.cleanup(worker).await,
             BTreeReqMeta::BulkLoad { okeys } => self.bulk_load(okeys).await,
             BTreeReqMeta::Load => {
-                self.tree_structure.block_cache.reset_load().await;
+                self.tree_structure.block_cache.reset_stats().await;
                 let kvs: Vec<(String, Vec<u8>)> =
                     tokio::task::block_in_place(move || bincode::deserialize(&payload).unwrap());
                 println!("Loading {} kv pairs.", kvs.len());
@@ -168,11 +169,11 @@ impl ActorInstance for BTreeActor {
                 println!("Resending {}.", not_owned.len());
                 let not_owned =
                     tokio::task::block_in_place(move || bincode::serialize(&not_owned).unwrap());
-                self.tree_structure.block_cache.reset_load().await;
+                self.tree_structure.block_cache.reset_stats().await;
                 (BTreeRespMeta::Ok, not_owned)
             }
             BTreeReqMeta::Unload => {
-                self.tree_structure.block_cache.reset_load().await;
+                self.tree_structure.block_cache.reset_stats().await;
                 let keys: Vec<String> =
                     tokio::task::block_in_place(move || bincode::deserialize(&payload).unwrap());
                 let mut not_owned = Vec::new();
@@ -187,7 +188,7 @@ impl ActorInstance for BTreeActor {
                 }
                 let not_owned =
                     tokio::task::block_in_place(move || bincode::serialize(&not_owned).unwrap());
-                self.tree_structure.block_cache.reset_load().await;
+                self.tree_structure.block_cache.reset_stats().await;
                 (BTreeRespMeta::Ok, not_owned)
             }
         };
@@ -200,9 +201,9 @@ impl ActorInstance for BTreeActor {
         println!("Checkpointing: termination={terminating}.");
         let tree_structure = self.tree_structure.clone();
         if terminating {
+            tree_structure.plog.terminate().await;
             self.terminating.store(true, atomic::Ordering::Release);
         }
-        Recovery::safe_truncate(tree_structure).await;
     }
 }
 
@@ -255,28 +256,34 @@ impl BTreeActor {
 
     async fn bookkeeping(
         tree_structure: Arc<BTreeStructure>,
-        _terminating: Arc<atomic::AtomicBool>,
+        terminating: Arc<atomic::AtomicBool>,
     ) {
         // Duration to sleep every second.
-        let sleep_duration = std::time::Duration::from_millis(1);
+        let sleep_duration = std::time::Duration::from_millis(100);
         // Truncate log every few seconds.
-        let truncation_duration = std::time::Duration::from_secs(5);
+        let mut truncation_duration = std::time::Duration::from_secs(2);
         let mut last_truncation = std::time::Instant::now();
-        // Retrieve and update load every 60s.
-        let load_duration = std::time::Duration::from_secs(60);
+        // Retrieve and update load.
+        let load_duration = std::time::Duration::from_secs(30);
         let mut last_load = std::time::Instant::now();
         loop {
             // Sleep a short duration.
             tokio::time::sleep(sleep_duration).await;
-            let now = std::time::Instant::now();
             // Flush.
             let plog = tree_structure.plog.clone();
-            tokio::spawn(async move {
-                plog.flush().await;
-            });
+            // let start_time = std::time::Instant::now();
+            plog.flush().await;
+            // let end_time = std::time::Instant::now();
+            // let duration = end_time.duration_since(start_time);
+            // println!("Bookkeeping flush duration: {duration:?}");
             // Check if should truncate.
+            if terminating.load(atomic::Ordering::Acquire) {
+                // Decrease truncation time when scaling down.
+                truncation_duration = std::time::Duration::from_millis(500);
+            }
+            let now = std::time::Instant::now();
             if now.duration_since(last_truncation) > truncation_duration {
-                last_truncation = std::time::Instant::now();
+                last_truncation = now;
                 let tree_structure = tree_structure.clone();
                 tokio::spawn(async move {
                     Recovery::safe_truncate(tree_structure).await;
@@ -284,10 +291,11 @@ impl BTreeActor {
             }
             // Check if should retrieve and update load.
             if now.duration_since(last_load) > load_duration {
-                last_load = std::time::Instant::now();
+                last_load = now;
                 let tree_structure = tree_structure.clone();
                 tokio::spawn(async move {
-                    let load = tree_structure.block_cache.retrieve_load().await;
+                    let load = tree_structure.block_cache.retrieve_stats().await;
+                    println!("Retrieved Load: {load:?}");
                     // Maintain lock to prevent concurrent change.
                     let running_state = tree_structure.running_state.read().await;
                     if running_state.is_active {

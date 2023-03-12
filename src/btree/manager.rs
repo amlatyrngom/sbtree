@@ -110,22 +110,25 @@ impl BTreeManager {
         // Read loads.
         let loads = self.global_ownership.read_loads().await;
         let (lo, next_lo, hi) = {
-            let mut loads: Vec<(String, f64)> = loads
+            let mut loads: Vec<(String, (f64, f64))> = loads
                 .iter()
                 .map(|(w_id, load)| (w_id.clone(), *load))
                 .collect();
-            loads.sort_by(|(_, load1), (_, load2)| load1.total_cmp(load2));
-            let lo = loads.get(0);
-            let next_lo = loads.get(1);
-            let hi = loads.last();
-            (lo.cloned(), next_lo.cloned(), hi.cloned())
+            // Find lowest gains.
+            loads.sort_by(|(_, (gain1, _)), (_, (gain2, _))| gain1.total_cmp(gain2));
+            let lo = loads.get(0).cloned();
+            let next_lo = loads.get(1).cloned();
+            // Find highest loss.
+            loads.sort_by(|(_, (_, loss1)), (_, (_, loss2))| loss1.total_cmp(loss2)); // Sorting is nefficient, but works.
+            let hi = loads.last().cloned();
+            (lo, next_lo, hi)
         };
 
         // Attempt scale out.
         match hi {
             None => {}
-            Some((hi_id, hi_load)) => {
-                if hi_load >= 1.1 {
+            Some((hi_id, (_, hi_loss))) => {
+                if hi_loss >= 1.0 {
                     let free_worker = self.global_ownership.get_free_worker(true).await;
                     let uid = uuid::Uuid::new_v4().to_string();
                     let rescaling_op = RescalingOp::ScaleOut {
@@ -147,17 +150,17 @@ impl BTreeManager {
         // Attempt scale in.
         match lo {
             None => {}
-            Some((lo_id, lo_load)) => {
+            Some((lo_id, (lo_gain, _))) => {
                 match next_lo {
                     None => {}
-                    Some((next_id, next_load)) => {
+                    Some((next_id, (next_gain, _))) => {
                         let (lo_id, next_id) = if lo_id == "manager" {
                             // Never scale in manager.
                             (next_id, lo_id)
                         } else {
                             (lo_id, next_id)
                         };
-                        if lo_load + next_load <= 0.9 {
+                        if lo_gain + next_gain <= 1.0 {
                             let uid = uuid::Uuid::new_v4().to_string();
                             let rescaling_op = RescalingOp::ScaleIn {
                                 from: lo_id,
