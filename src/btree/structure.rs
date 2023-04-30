@@ -3,6 +3,7 @@ use super::local_ownership::LocalOwnership;
 use super::recovery::{Recovery, RunningState};
 use super::{BTreeLogEntry, BTreeRespMeta};
 use crate::global_ownership::GlobalOwnership;
+// use obelisk::persistence::database::Database;
 use obelisk::PersistentLog;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -57,6 +58,7 @@ impl BTreeStructure {
         let running_state = Arc::new(RwLock::new(RunningState::new(plog.clone(), true, 1, "")));
         let shared_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&shared_config); // Should be cached.
+                                                                 // Self::bench_sqlite().await;
         BTreeStructure {
             owner_id: owner_id.into(),
             block_cache,
@@ -68,6 +70,67 @@ impl BTreeStructure {
             s3_client,
         }
     }
+
+    // async fn bench_sqlite() {
+    //     let shared_prefix = obelisk::common::shared_storage_prefix();
+    //     let db_dir = format!("{shared_prefix}/essai_dir");
+    //     let _ = std::fs::remove_dir_all(&db_dir);
+    //     let _ = std::fs::create_dir_all(&db_dir).unwrap();
+    //     let db_file = format!("essai.db");
+    //     let db = Database::new(&db_dir, &db_file, false).unwrap();
+    //     let mut conn = db.pool.get().unwrap();
+    //     conn.execute("CREATE TABLE essai(key INT PRIMARY KEY, value INT)", [])
+    //         .unwrap();
+    //     println!("Doing inserts!");
+    //     let mut durations = Vec::new();
+    //     for i in 0..10 {
+    //         let start_time = std::time::Instant::now();
+    //         let _ = conn
+    //             .execute("REPLACE INTO essai VALUES (?, ?)", [i, i])
+    //             .unwrap();
+    //         let end_time = std::time::Instant::now();
+    //         durations.push(end_time.duration_since(start_time));
+    //     }
+    //     println!("Multiple Insert durations: {durations:?}");
+    //     println!("Doing gets!");
+    //     let mut durations = Vec::new();
+    //     for i in 0..10 {
+    //         let start_time = std::time::Instant::now();
+    //         let _res: usize = conn
+    //             .query_row("SELECT * FROM essai WHERE key=?", [i], |row| row.get(0))
+    //             .unwrap();
+    //         let end_time = std::time::Instant::now();
+    //         durations.push(end_time.duration_since(start_time));
+    //     }
+    //     println!("Get durations: {durations:?}");
+    //     println!("Doing gets again!");
+    //     let mut durations = Vec::new();
+    //     for i in 0..10 {
+    //         let start_time = std::time::Instant::now();
+    //         let _res: usize = conn
+    //             .query_row("SELECT * FROM essai WHERE key=?", [i], |row| row.get(0))
+    //             .unwrap();
+    //         let end_time = std::time::Instant::now();
+    //         durations.push(end_time.duration_since(start_time));
+    //     }
+    //     println!("Get again durations: {durations:?}");
+    //     println!("Doing txns!");
+    //     let mut durations = Vec::new();
+    //     let txn = conn.transaction().unwrap();
+    //     let start_time = std::time::Instant::now();
+    //     for i in 0..10 {
+    //         let start_time = std::time::Instant::now();
+    //         let _ = txn
+    //             .execute("REPLACE INTO essai VALUES (?, ?)", [i, i + 1])
+    //             .unwrap();
+    //         let end_time = std::time::Instant::now();
+    //         durations.push(end_time.duration_since(start_time));
+    //     }
+    //     txn.commit().unwrap();
+    //     let end_time = std::time::Instant::now();
+    //     durations.push(end_time.duration_since(start_time));
+    //     println!("Txn durations: {durations:?}");
+    // }
 
     /// Initialize structure.
     pub async fn initialize(&self) {
@@ -113,6 +176,7 @@ impl BTreeStructure {
             // Do not repeat already performed operation.
             let running_state = self.running_state.read().await;
             if running_state.last_rescaling_uid == rescaling_uid {
+                println!("Rescaling. Already done.");
                 return;
             }
         }
@@ -140,11 +204,13 @@ impl BTreeStructure {
                         locks.push(ownership_lock.clone().write_owned().await);
                         to_transfer.push(ownership_key.clone());
                     } else {
-                        // DO NOT COMPARE WITH 0.
-                        // This is because the lowest key should not be moved. It belongs to the manager.
+                        // // DO NOT COMPARE WITH 0.
+                        // // This is because the lowest key should not be moved. It belongs to the manager.
                         if i % 2 == 1 {
                             locks.push(ownership_lock.clone().write_owned().await);
                             to_transfer.push(ownership_key.clone());
+                            // Break for lightweight testing.
+                            // break;
                         }
                     }
                 }
@@ -154,7 +220,7 @@ impl BTreeStructure {
                 (to_transfer, locks)
             }
         };
-        println!("Transferring keys: {to_transfer:?}. RemoveSelf={remove_self}");
+        println!("Rescaling: Transferring keys: {to_transfer:?}. RemoveSelf={remove_self}");
         // Log operation if not recovering.
         let lsn = match recovery {
             Some((lsn, _)) => lsn,
@@ -171,13 +237,18 @@ impl BTreeStructure {
         };
         // Do transfer.
         for ownership_key in &to_transfer {
+            println!("Rescaling. Removing ownership key: {ownership_key:?}");
             self.block_cache
                 .remove_ownership_key(ownership_key, false)
                 .await;
             // Redo the remove here in case we are recovering.
-            let mut ownership = self.ownership.write().await;
-            ownership.remove(ownership_key);
+            if recovery.is_some() {
+                let mut ownership = self.ownership.write().await;
+                ownership.remove(ownership_key);
+            }
+            println!("Rescaling. Removed ownership key: {ownership_key:?}");
         }
+        println!("Rescaling. Performing Transfer to {to_owner:?}: {to_transfer:?}.");
         self.global_ownership
             .perform_ownership_transfer(to_owner, to_transfer)
             .await;
@@ -197,6 +268,7 @@ impl BTreeStructure {
             self.global_ownership.update_load(new_load).await;
         }
         Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
+        println!("Done Rescaling.");
     }
 
     /// Handle put logic common to normal operations and recovery.
@@ -581,7 +653,7 @@ impl BTreeStructure {
             let ownership_change_lock = self.ownership_change_lock.write().await;
             Some(ownership_change_lock)
         };
-        println!("Fetching new ownership!");
+        // println!("Fetching new ownership!");
         let new_ownership: HashSet<String> = self
             .global_ownership
             .fetch_ownership_keys()

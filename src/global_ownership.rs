@@ -59,7 +59,7 @@ impl GlobalOwnership {
     /// Get a free worker.
     /// When `wait_for_spin_up` is set, this call will wait for the actor
     /// to spin up from a lambda to a dedicated instance.
-    pub async fn get_free_worker(&self, wait_for_spin_up: bool) -> String {
+    pub async fn get_free_worker(&self) -> String {
         let (free_owner, is_new) = {
             let mut inner = self.inner.write().unwrap();
             if inner.free_owners.is_empty() {
@@ -75,10 +75,7 @@ impl GlobalOwnership {
             self.mark_owner_state(&free_owner, true).await;
         }
         // Cache and possibly spin up new owner.
-        let mc = self.get_or_make_client(&free_owner).await;
-        if wait_for_spin_up {
-            mc.spin_up().await;
-        }
+        let _mc = self.get_or_make_client(&free_owner).await;
         free_owner
     }
 
@@ -245,7 +242,7 @@ impl GlobalOwnership {
     /// Start rescaling.
     /// Only one rescaling can happen at a time.
     pub async fn start_rescaling(&self, rescaling_op: RescalingOp, recovering: bool) -> bool {
-        if recovering {
+        if !recovering {
             loop {
                 let rescaling_op = serde_json::to_string(&rescaling_op).unwrap();
                 let resp = self
@@ -348,7 +345,7 @@ impl GlobalOwnership {
                     let x = format!("{x:?}");
                     if Self::is_normal_dynamo_error(&x) {
                         // Sleep to avoid high request rate on dynamo.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         panic!("Bad dynamo error {x}");
                     }
                     continue;
@@ -364,7 +361,6 @@ impl GlobalOwnership {
 
     /// Update load.
     pub async fn update_load(&self, load: String) {
-        // First multiply by a 1000 to prevent floating point issues.
         let owner_id = self.owner_id.clone().unwrap();
         loop {
             let resp = self
@@ -467,11 +463,24 @@ impl GlobalOwnership {
     /// Perform ownership transfer.
     /// Should only be called by the `from` owner.
     pub async fn perform_ownership_transfer(&self, to: &str, ownership_keys: Vec<String>) {
-        let from = self.owner_id.clone().unwrap();
-        for ownership_key in ownership_keys {
-            self.add_ownership_key(to, &ownership_key).await;
-            self.remove_ownership_key(&from, &ownership_key, false)
-                .await;
+        let chunk_size = ownership_keys.len() / 8 + 1;
+        let chunks: Vec<&[String]> = ownership_keys.chunks(chunk_size).collect();
+        let mut ts = Vec::new();
+        for chunk in chunks {
+            let from = self.owner_id.clone().unwrap();
+            let chunk = chunk.to_vec();
+            let this = self.clone();
+            let to = to.to_string();
+            ts.push(tokio::spawn(async move {
+                for ownership_key in chunk {
+                    this.add_ownership_key(&to, &ownership_key).await;
+                    this.remove_ownership_key(&from, &ownership_key, false)
+                        .await;
+                }
+            }));
+        }
+        for t in ts {
+            t.await.unwrap();
         }
     }
 
@@ -489,6 +498,7 @@ impl GlobalOwnership {
             match resp {
                 Err(x) => {
                     let x = format!("{x:?}");
+                    println!("Rescaling: {x:?}");
                     if Self::is_normal_dynamo_error(&x) {
                         // Sleep to avoid high request rate on dynamo.
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -521,7 +531,7 @@ impl GlobalOwnership {
                     let x = format!("{x:?}");
                     if Self::is_normal_dynamo_error(&x) {
                         // Sleep to avoid high request rate on dynamo.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         panic!("Bad dynamo error {x}");
                     }
                     continue;

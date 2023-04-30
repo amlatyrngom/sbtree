@@ -1,4 +1,5 @@
 **/target
+**/.function_build
 **/.obelisk_build
 **/obelisk_shared_data
 **/.venv
@@ -6,3 +7,5 @@
 **/.ipynb_checkpoints
 pitch.md
 **/obelisk
+**/*.zip
+essai.md

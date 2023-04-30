@@ -24,6 +24,9 @@ pub enum BenchOp {
         value: Vec<u8>,
         dynamo: bool,
     },
+    Infer {
+        
+    }
 }
 
 #[async_trait::async_trait]

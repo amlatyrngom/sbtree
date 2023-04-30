@@ -44,6 +44,7 @@ impl BTreeClient {
                 let _resp = mc.send_message(&req_meta, &[]).await;
             });
         }
+        let mut num_tries = 0;
         loop {
             // Get current owner.
             let (ownership_key, owner_id) =
@@ -66,19 +67,25 @@ impl BTreeClient {
                     break (resp_meta, resp_payload);
                 } else {
                     // Change later.
-                    println!("Unable to send messaging. Exiting for test!");
-                    std::process::exit(1);
+                    num_tries += 1;
+                    if num_tries > 10 {
+                        println!("Unable to send messaging. Exiting for test!");
+                        std::process::exit(1);
+                    }
                 }
             };
             // If bad owner, retry without cache.
             match &resp_meta {
                 BTreeRespMeta::BadOwner => {
+                    num_tries += 1;
                     println!("Owner ({owner_id}, {ownership_key}) is wrong owner");
-                    if !try_cache {
-                        println!("Remove after testing");
-                        std::process::exit(1);
+                    if num_tries > 10 {
+                        if !try_cache {
+                            println!("Could not find owner. Remove after testing");
+                            std::process::exit(1);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     try_cache = false;
                     continue;
                 }

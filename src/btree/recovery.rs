@@ -314,7 +314,11 @@ impl Recovery {
             }
         }
         done_tx.send(()).unwrap();
-        (self.tree_structure, already_running)
+        let has_ownerships = {
+            let ownership = self.tree_structure.ownership.read().await;
+            !ownership.is_empty()
+        };
+        (self.tree_structure, already_running && has_ownerships)
     }
 
     async fn recover_bulk_load(&mut self, lsn: usize, okeys: Vec<String>) {

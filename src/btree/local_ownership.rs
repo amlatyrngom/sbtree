@@ -25,15 +25,15 @@ impl LocalOwnership {
                     continue;
                 }
             };
-            let start_time = std::time::Instant::now();
+            // let start_time = std::time::Instant::now();
             let resp = conn.query_row(
                 "SELECT data FROM blocks WHERE block_id=?",
                 [block_id],
                 |row| row.get(0),
             );
-            let end_time = std::time::Instant::now();
-            let duration = end_time.duration_since(start_time);
-            println!("Fetch block duration: {duration:?}");
+            // let end_time = std::time::Instant::now();
+            // let duration = end_time.duration_since(start_time);
+            // println!("Fetch block duration: {duration:?}");
             match resp {
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
                     break None;
@@ -313,7 +313,7 @@ impl LocalOwnership {
 
     /// Release lock on file.
     pub async fn release(self) {
-        tokio::task::block_in_place(move || {
+        tokio::task::spawn_blocking(move || {
             let conn = loop {
                 match self.pool.get() {
                     Ok(conn) => break conn,
@@ -392,34 +392,42 @@ impl LocalOwnership {
             if !first {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            first = true;
+            first = false;
             let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_file);
             // Set to 1 to prevent concurrency issues.
             let pool = match r2d2::Pool::builder().max_size(1).build(manager) {
                 Ok(pool) => pool,
                 Err(x) => {
-                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
+                    println!("NewLocalOwnership Pool {ownership_key:?}: {x:?}");
+                    let file = std::fs::File::open(&db_file);
+                    println!("File: {file:?}");
                     continue;
                 }
             };
             let mut conn = match pool.get() {
                 Ok(conn) => conn,
                 Err(x) => {
-                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
+                    println!("NewLocalOwnership Conn {ownership_key:?}: {x:?}");
+                    let file = std::fs::File::open(&db_file);
+                    println!("File: {file:?}");
                     continue;
                 }
             };
             match conn.pragma_update(None, "locking_mode", "exclusive") {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
+                    println!("NewLocalOwnership Pragma1 {ownership_key:?}: {x:?}");
+                    let file = std::fs::File::open(&db_file);
+                    println!("File: {file:?}");
                     continue;
                 }
             }
             match conn.pragma_update(None, "journal_mode", "wal") {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("NewLocalOwnership {ownership_key:?}: {x:?}");
+                    println!("NewLocalOwnership Pragma2 {ownership_key:?}: {x:?}");
+                    let file = std::fs::File::open(&db_file);
+                    println!("File: {file:?}");
                     continue;
                 }
             }

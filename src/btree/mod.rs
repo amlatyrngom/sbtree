@@ -225,6 +225,7 @@ impl BTreeActor {
         let old_flush_lsn = tree_structure.plog.get_flush_lsn().await;
         {
             let mut running_state = tree_structure.running_state.write().await;
+            running_state.is_active = name == "manager" || already_running;
             running_state.checkpoint().await;
         }
         tree_structure.plog.truncate(old_flush_lsn).await.unwrap();
@@ -310,7 +311,7 @@ impl BTreeActor {
 
     /// Rescale.
     pub async fn rescale(&self, op: RescalingOp) -> (BTreeRespMeta, Vec<u8>) {
-        println!("Worker {}. Received rescaling: {op:?}", self.owner_id);
+        println!("Worker {}. Received Rescaling: {op:?}", self.owner_id);
         let (rescaling_uid, from, to, scaling_in) = match op {
             RescalingOp::ScaleIn { from, to, uid } => (uid, from, to, true),
             RescalingOp::ScaleOut { from, to, uid } => (uid, from, to, false),

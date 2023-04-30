@@ -2,6 +2,7 @@ mod bench_fn;
 mod btree;
 mod client;
 mod global_ownership;
+// pub mod sqlite;
 
 pub use bench_fn::BenchFn;
 pub use btree::BTreeActor;

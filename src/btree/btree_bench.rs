@@ -4,7 +4,7 @@ mod tests {
     use crate::btree::BTreeRespMeta;
     use obelisk::{FunctionalClient, PersistentLog};
     use rand::distributions::Distribution;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
 
     use crate::{BTreeActor, BTreeClient};
@@ -60,6 +60,98 @@ mod tests {
                 .key(
                     "entry_type",
                     aws_sdk_dynamodb::model::AttributeValue::S("load".into()),
+                )
+                .key(
+                    "owner_id",
+                    aws_sdk_dynamodb::model::AttributeValue::S(owner_id),
+                )
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Reset test.
+    async fn reset_ownership() {
+        // Read from dynamodb.
+        let shared_config = aws_config::load_from_env().await;
+        let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
+        let resp = dynamo_client
+            .execute_statement()
+            .statement("SELECT owner_id, ownership_key FROM sbtree_ownership")
+            .consistent_read(true)
+            .send()
+            .await
+            .unwrap();
+        let resp: Vec<(String, String)> = resp
+            .items()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                let owner = item.get("owner_id").unwrap().as_s().cloned().unwrap();
+                let ownership_key = item.get("ownership_key").unwrap().as_s().cloned().unwrap();
+                (owner, ownership_key)
+            })
+            .collect();
+        let mut deleted_owners: HashSet<String> = HashSet::new();
+        for (owner_id, ownership_key) in resp {
+            if owner_id == "manager" {
+                continue;
+            }
+            println!("Resetting: {owner_id:?}; {ownership_key:?}.");
+
+            dynamo_client
+                .put_item()
+                .table_name("sbtree_ownership")
+                .item(
+                    "owner_id",
+                    aws_sdk_dynamodb::model::AttributeValue::S("manager".into()),
+                )
+                .item(
+                    "ownership_key",
+                    aws_sdk_dynamodb::model::AttributeValue::S(ownership_key.clone()),
+                )
+                .send()
+                .await
+                .unwrap();
+            dynamo_client
+                .delete_item()
+                .table_name("sbtree_ownership")
+                .key(
+                    "owner_id",
+                    aws_sdk_dynamodb::model::AttributeValue::S(owner_id.clone()),
+                )
+                .key(
+                    "ownership_key",
+                    aws_sdk_dynamodb::model::AttributeValue::S(ownership_key),
+                )
+                .send()
+                .await
+                .unwrap();
+            if deleted_owners.contains(&owner_id) {
+                continue;
+            }
+            deleted_owners.insert(owner_id.clone());
+            dynamo_client
+                .delete_item()
+                .table_name("sbtree_rescaling")
+                .key(
+                    "entry_type",
+                    aws_sdk_dynamodb::model::AttributeValue::S("load".into()),
+                )
+                .key(
+                    "owner_id",
+                    aws_sdk_dynamodb::model::AttributeValue::S(owner_id.clone()),
+                )
+                .send()
+                .await
+                .unwrap();
+            dynamo_client
+                .delete_item()
+                .table_name("sbtree_rescaling")
+                .key(
+                    "entry_type",
+                    aws_sdk_dynamodb::model::AttributeValue::S("freelist".into()),
                 )
                 .key(
                     "owner_id",
@@ -136,20 +228,15 @@ mod tests {
     }
 
     /// Write bench output.
-    async fn write_bench_output(points: Vec<(u64, f64, f64, f64)>, expt_name: &str) {
+    async fn write_bench_output(points: Vec<(u64, String, f64)>, expt_name: &str) {
         let expt_dir = "results/bench";
         std::fs::create_dir_all(expt_dir).unwrap();
         let mut writer = csv::WriterBuilder::new()
             .from_path(format!("{expt_dir}/{expt_name}.csv"))
             .unwrap();
-        for (since, get_duration, put_duration, active_duration) in points {
+        for (since, op_type, duration) in points {
             writer
-                .write_record(&[
-                    since.to_string(),
-                    get_duration.to_string(),
-                    put_duration.to_string(),
-                    active_duration.to_string(),
-                ])
+                .write_record(&[since.to_string(), op_type, duration.to_string()])
                 .unwrap();
         }
         writer.flush().unwrap();
@@ -161,6 +248,12 @@ mod tests {
         Low,
         Medium,
         High(usize),
+    }
+
+    #[derive(Debug, Clone)]
+    enum RequestDistribution {
+        Cached,
+        Zipf,
     }
 
     // /// Simple test.
@@ -440,6 +533,10 @@ mod tests {
                 assert_eq!(val, expected);
             }
         }
+        if step == "reset" {
+            std::env::set_var("EXECUTION_MODE", "");
+            reset_ownership().await;
+        }
 
         (insert_size_mb * 1024) / val_size_kb
     }
@@ -482,49 +579,163 @@ mod tests {
         }
     }
 
+    async fn run_benchmark(
+        fc: Arc<FunctionalClient>,
+        prefix: &str,
+        rate: RequestRate,
+        dist: RequestDistribution,
+        num_keys: usize,
+        key_size: usize,
+    ) {
+        // Run bench.
+        let (activity, num_workers) = match rate {
+            RequestRate::Low => (0.1, 1),
+            RequestRate::Medium => (1.0, 1),
+            RequestRate::High(num_workers) => (1.0, num_workers),
+        };
+        // This is just a hack for testing. Should all be reset to 10 minutes.
+        // let test_duration = if num_workers == 1 {
+        //     std::time::Duration::from_secs(60 * 5) // 5 minutes.
+        // } else {
+        //     std::time::Duration::from_secs(60 * 10) // 10 minutes.
+        // };
+        let test_duration = std::time::Duration::from_secs(60 * 15); // 10 minutes.
+        let mut workers = Vec::new();
+        for n in 0..num_workers {
+            let fc = fc.clone();
+            let test_duration = test_duration.clone();
+            let dist = dist.clone();
+            workers.push(tokio::spawn(async move {
+                let mut results: Vec<(u64, String, f64)> = Vec::new();
+                let start_time = std::time::Instant::now();
+                loop {
+                    let curr_time = std::time::Instant::now();
+                    let since = curr_time.duration_since(start_time);
+                    if since > test_duration {
+                        break;
+                    }
+                    let since = since.as_millis() as u64;
+                    // Create operations.
+                    let mut ops = Vec::new();
+                    match dist {
+                        RequestDistribution::Cached => {
+                            let key = (n + 1) as usize;
+                            for i in 0..2 {
+                                if i == 1 {
+                                    ops.push(crate::bench_fn::BenchOp::Put {
+                                        key: key.to_string(),
+                                        value: make_value(key, key_size),
+                                        dynamo: false,
+                                    });
+                                } else {
+                                    ops.push(crate::bench_fn::BenchOp::Get {
+                                        key: key.to_string(),
+                                        dynamo: false,
+                                    });
+                                }
+                            }
+                        }
+                        RequestDistribution::Zipf => {
+                            // This variable cannot exist beyond await point. So cannot move out of the loop.
+                            let mut rng = rand::thread_rng();
+                            let zipf = zipf::ZipfDistribution::new(num_keys, 1.0).unwrap();
+                            for _ in 0..3 {
+                                let key: usize = zipf.sample(&mut rng);
+                                ops.push(crate::bench_fn::BenchOp::Get {
+                                    key: key.to_string(),
+                                    dynamo: false,
+                                });
+                            }
+                        }
+                    }
+
+                    let ops = serde_json::to_vec(&ops).unwrap();
+                    let start_time = std::time::Instant::now();
+                    let resp = fc.invoke(&ops).await;
+                    if resp.is_err() {
+                        println!("Err: {resp:?}");
+                        continue;
+                    }
+                    let resp = resp.unwrap();
+                    let (get_durations, put_durations): (
+                        Vec<std::time::Duration>,
+                        Vec<std::time::Duration>,
+                    ) = serde_json::from_value(resp).unwrap();
+                    let end_time = std::time::Instant::now();
+                    let mut active_time =
+                        end_time.duration_since(start_time).as_secs_f64() * 1000.0;
+
+                    if n < 2 {
+                        // Avoid too many prints.
+                        println!("Worker {n} Get Durations: {get_durations:?}");
+                        println!("Worker {n} Put Durations: {put_durations:?}");
+                        println!("Worker {n} Since: {since:?}");
+                    }
+                    for get_duration in get_durations {
+                        let get_duration = get_duration.as_secs_f64() * 1000.0;
+                        results.push((since, "Get".into(), get_duration));
+                    }
+                    for put_duration in put_durations {
+                        let put_duration = put_duration.as_secs_f64() * 1000.0;
+                        results.push((since, "Put".into(), put_duration));
+                    }
+                    // Time to wait to get desired activity.
+                    if active_time < 25.0 {
+                        // Treat like a lambda because of activity metrics.
+                        active_time = 25.0;
+                    }
+                    let wait_time = active_time / activity - active_time;
+                    if wait_time > 1e-4 {
+                        let wait_time = std::time::Duration::from_millis(wait_time.ceil() as u64);
+                        tokio::time::sleep(wait_time).await;
+                    }
+                }
+                results
+            }));
+        }
+        let mut results = Vec::new();
+        for w in workers {
+            let mut r = w.await.unwrap();
+            results.append(&mut r);
+        }
+        write_bench_output(results, &format!("{prefix}_{rate:?}")).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn run_scaling_bench() {
+    async fn scaling_bench() {
         let step = "run";
         let num_keys = init_large_bench_test(step).await;
         if step != "run" {
             return;
         }
         std::env::set_var("EXECUTION_MODE", "");
-        let test_duration = std::time::Duration::from_secs_f64(60.0 * 3.0);
-        let start_time = std::time::Instant::now();
-        let mut rng = rand::thread_rng();
-        let zipf = zipf::ZipfDistribution::new(num_keys, 1.0).unwrap();
-        let fc = FunctionalClient::new("sbtree").await;
-        loop {
-            let curr_time = std::time::Instant::now();
-            let since = curr_time.duration_since(start_time);
-            if since > test_duration {
-                break;
-            }
-            let mut ops = Vec::new();
-            for _ in 0..10 {
-                let key: usize = zipf.sample(&mut rng);
-                ops.push(crate::bench_fn::BenchOp::Get {
-                    key: key.to_string(),
-                    dynamo: false,
-                });
-            }
-            let ops = serde_json::to_vec(&ops).unwrap();
-            // let start_time = std::time::Instant::now();
-            let resp = fc.invoke(&ops).await;
-            if resp.is_err() {
-                println!("Err: {resp:?}");
-                continue;
-            }
-            let resp = resp.unwrap();
-            let (get_duration, put_duration): (Vec<std::time::Duration>, Vec<std::time::Duration>) =
-                serde_json::from_value(resp).unwrap();
-            // let end_time = std::time::Instant::now();
-            // let mut active_time = end_time.duration_since(start_time).as_secs_f64() * 1000.0;
-            println!("Get Durations: {get_duration:?}");
-            println!("Put Durations: {put_duration:?}");
-        }
-
-        
+        let fc = Arc::new(FunctionalClient::new("sbtree").await);
+        run_benchmark(
+            fc.clone(),
+            "essai1",
+            RequestRate::Medium,
+            RequestDistribution::Zipf,
+            num_keys,
+            16000,
+        )
+        .await;
+        run_benchmark(
+            fc.clone(),
+            "essai2",
+            RequestRate::High(8),
+            RequestDistribution::Zipf,
+            num_keys,
+            16000,
+        )
+        .await;
+        run_benchmark(
+            fc.clone(),
+            "essai3",
+            RequestRate::Medium,
+            RequestDistribution::Zipf,
+            num_keys,
+            16000,
+        )
+        .await;
     }
 }

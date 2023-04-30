@@ -5,6 +5,8 @@ use crate::global_ownership::GlobalOwnership;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+const MANAGER_LOSS_THRESHOLD: f64 = 1.0;
+
 /// BTree Manager.
 pub struct BTreeManager {
     global_ownership: Arc<GlobalOwnership>,
@@ -26,9 +28,13 @@ impl BTreeManager {
 
     /// Perform rescaling.
     pub async fn manage_rescaling(&self, rescaling_op: RescalingOp, recovering: bool) {
-        self.global_ownership
+        let valid = self
+            .global_ownership
             .start_rescaling(rescaling_op.clone(), recovering)
             .await;
+        if !valid {
+            return;
+        }
         let (from, to) = match &rescaling_op {
             RescalingOp::ScaleIn { from, to, uid: _ } => (from, to),
             RescalingOp::ScaleOut { from, to, uid: _ } => (from, to),
@@ -44,6 +50,9 @@ impl BTreeManager {
             let resp = from_mc.send_message(&req, &[]).await;
             if resp.is_some() {
                 break;
+            } else {
+                println!("Rescale Error: {resp:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
         loop {
@@ -51,6 +60,9 @@ impl BTreeManager {
             let resp = to_mc.send_message(&req, &[]).await;
             if resp.is_some() {
                 break;
+            } else {
+                println!("Rescale Error: {resp:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
         self.global_ownership.finish_rescaling().await;
@@ -123,26 +135,23 @@ impl BTreeManager {
             let hi = loads.last().cloned();
             (lo, next_lo, hi)
         };
+        println!("Manager: lo={lo:?}; next_lo={next_lo:?}; hi={hi:?}");
 
         // Attempt scale out.
         match hi {
             None => {}
             Some((hi_id, (_, hi_loss))) => {
-                if hi_loss >= 1.0 {
-                    let free_worker = self.global_ownership.get_free_worker(true).await;
+                if hi_loss >= MANAGER_LOSS_THRESHOLD && loads.len() < 2 {
+                    let free_worker = self.global_ownership.get_free_worker().await;
+                    println!("Manager: Splitting({hi_id}, to={free_worker}).");
                     let uid = uuid::Uuid::new_v4().to_string();
                     let rescaling_op = RescalingOp::ScaleOut {
                         from: hi_id,
                         to: free_worker,
                         uid,
                     };
-                    let valid = self
-                        .global_ownership
-                        .start_rescaling(rescaling_op.clone(), false)
-                        .await;
-                    if valid {
-                        self.manage_rescaling(rescaling_op, false).await;
-                    }
+                    println!("Manager rescaling: {rescaling_op:?}");
+                    self.manage_rescaling(rescaling_op, false).await;
                 }
             }
         }
@@ -160,20 +169,15 @@ impl BTreeManager {
                         } else {
                             (lo_id, next_id)
                         };
-                        if lo_gain + next_gain <= 1.0 {
+                        if lo_gain + next_gain < 2.0 {
+                            println!("Manager: Merging(from={lo_id}, to={next_id}).");
                             let uid = uuid::Uuid::new_v4().to_string();
                             let rescaling_op = RescalingOp::ScaleIn {
                                 from: lo_id,
                                 to: next_id,
                                 uid,
                             };
-                            let valid = self
-                                .global_ownership
-                                .start_rescaling(rescaling_op.clone(), false)
-                                .await;
-                            if valid {
-                                self.manage_rescaling(rescaling_op, false).await;
-                            }
+                            self.manage_rescaling(rescaling_op, false).await;
                         }
                     }
                 }

@@ -14,7 +14,7 @@ pub const MOVING_FACTOR: f64 = 0.25;
 /// ECS Base Cost.
 pub const ECS_BASE_COST: f64 = 0.015;
 /// Number of milliseconds gained for each cache access.
-pub const CACHE_GAIN_MS: f64 = 15.0;
+pub const CACHE_GAIN_MS: f64 = 10.0;
 /// Reference to a block
 pub type TreeBlockRef = Arc<RwLock<TreeBlock>>;
 
@@ -83,15 +83,14 @@ impl BlockCache {
         let total_mem = std::env::var("MEMORY").unwrap_or_else(|_| "1".into());
         let mut total_mem: usize = total_mem.parse().unwrap();
         let vcpus: f64 = (total_mem as f64) / 2048.0;
-        // 512MB seems to be the amount of memory used as a baseline.
-        if total_mem > 512 {
-            total_mem -= 512;
-        }
-        // 90% of available memory. Rest should be for pinned stuff and for other data structures.
-        total_mem = (total_mem * (1024 * 1024) * 90) / 100;
         if !obelisk::common::has_external_access() {
+            // For lambda.
             total_mem /= 4;
         }
+        // 256MB seems to be the amount of memory used as a baseline.
+        total_mem -= 256;
+        // Use a percentage of memory as a cache. The rest is handled by os cache.
+        total_mem = (total_mem * 1000 * 1000 * 50) / 100;
         // Inner.
         let inner = Arc::new(Mutex::new(BlockCacheInner {
             avail_space: total_mem,
@@ -105,7 +104,7 @@ impl BlockCache {
             time: std::time::Instant::now(),
             miss_count: 0,
             access_count: 0,
-            gain: 1.0,
+            gain: 2.0,
             loss: 0.5,
         }));
         // Make object.
@@ -199,7 +198,7 @@ impl BlockCache {
         let mut stats = self.stats.lock().await;
         stats.miss_count = 0;
         stats.access_count = 0;
-        stats.gain = 1.0; // Prevent sudden scale downs.
+        stats.gain = 2.0; // Prevent sudden scale downs.
         stats.loss = 0.5; // Prevent sudden scale ups.
         stats.time = std::time::Instant::now();
         let stats = (stats.gain, stats.loss);
@@ -216,7 +215,8 @@ impl BlockCache {
         if since > std::time::Duration::from_secs(20) {
             let (new_gain, new_loss) = if obelisk::common::has_external_access() {
                 let lambda_cost = 0.0000000083 * CACHE_GAIN_MS; // Cost of 512MB.
-                let access_per_sec = (stats.access_count as f64) / since.as_secs_f64();
+                let leaf_accesses = (stats.access_count as f64) / 2.0;
+                let access_per_sec = leaf_accesses / since.as_secs_f64();
                 let miss_per_sec = (stats.miss_count as f64) / since.as_secs_f64();
                 println!(
                     "Retrieving stats. AccessPerSec={access_per_sec}; MissPerSec={miss_per_sec}"
@@ -234,7 +234,7 @@ impl BlockCache {
                 println!("Retrieving stats. NewGain={new_gain}; NewLoss={new_loss}");
                 (new_gain, new_loss)
             } else {
-                (1.0, 0.5)
+                (2.0, 0.5)
             };
             // Moving average.
             stats.gain = (1.0 - MOVING_FACTOR) * stats.gain + MOVING_FACTOR * new_gain;

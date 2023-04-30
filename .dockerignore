@@ -1,3 +1,7 @@
 **/target
-**/.function_build
 **/obelisk_shared_data
+**/figures
+*.ipynb
+**/venv
+**/*.zip
+
