@@ -1,0 +1,7 @@
+namespace = "infer"
+
+[functional]
+path = "sbtree::InferFn"
+mem_size = 128
+timeout = 10
+concurrency = 100
