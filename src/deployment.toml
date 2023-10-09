@@ -1,15 +1,23 @@
 namespace = "sbtree"
-
-[functional]
-path = "sbtree::BenchFn"
-mem_size = 512
-timeout = 30
-concurrency = 100
+dependencies = ["wal", "functional"]
 
 
-[messaging]
+[[handlers]]
+name = "sbactor"
+subsystem = "functional"
 path = "sbtree::BTreeActor"
-mem_size = 4096
-timeout = 10
-fn_mem = 1024
-caller_mem = 512
+mem = 3538
+timeout = 30
+persistent = true
+unique = true
+scaleup = 1.0
+
+
+# [[handlers]]
+# name = "sbbench"
+# subsystem = "functional"
+# path = "sbtree::BenchFn"
+# mem = 512
+# scaleup = -1.0
+# timeout = 30
+# concurrency = 1

@@ -1,7 +1,7 @@
 use super::block::{BlockCache, TreeBlock, TreeBlockRef};
 use super::local_ownership::LocalOwnership;
 use super::recovery::{Recovery, RunningState};
-use super::{BTreeLogEntry, BTreeRespMeta};
+use super::{BTreeLogEntry, BTreeRespMeta, MANAGER_ID};
 use crate::global_ownership::GlobalOwnership;
 // use obelisk::persistence::database::Database;
 use obelisk::PersistentLog;
@@ -134,7 +134,7 @@ impl BTreeStructure {
 
     /// Initialize structure.
     pub async fn initialize(&self) {
-        if self.owner_id != "manager" {
+        if self.owner_id != MANAGER_ID {
             // Nothing to do.
             return;
         }
@@ -162,114 +162,114 @@ impl BTreeStructure {
         ownership.insert(ownership_key, Arc::new(RwLock::new(())));
     }
 
-    /// Logic for rescaling.
-    pub async fn perform_rescaling(
-        &self,
-        rescaling_uid: &str,
-        to_owner: &str,
-        remove_self: bool,
-        recovery: Option<(usize, Vec<String>)>,
-    ) {
-        let _ownership_change_lock = self.ownership_change_lock.write().await;
-        // If not recovering, avoid redo.
-        if recovery.is_none() {
-            // Do not repeat already performed operation.
-            let running_state = self.running_state.read().await;
-            if running_state.last_rescaling_uid == rescaling_uid {
-                println!("Rescaling. Already done.");
-                return;
-            }
-        }
-        // If target of ownership change, mark self as active.
-        if to_owner == self.owner_id {
-            let new_load = self.block_cache.reset_stats().await;
-            self.global_ownership.update_load(new_load).await;
-            let this = self.clone();
-            this.fetch_new_ownership(true).await; // Lock already held.
-            let mut running_state = self.running_state.write().await;
-            running_state.last_rescaling_uid = rescaling_uid.into();
-            running_state.is_active = true;
-            running_state.checkpoint().await;
-            return;
-        }
-        // If source to ownership change, must transfer nodes after guarantees that all ongoing queries are finished.
-        let (to_transfer, _locks) = match &recovery {
-            Some((_, to_transfer)) => (to_transfer.to_vec(), vec![]),
-            None => {
-                let mut to_transfer = Vec::new();
-                let mut locks = Vec::new();
-                let mut ownership = self.ownership.write().await;
-                for (i, (ownership_key, ownership_lock)) in ownership.iter().enumerate() {
-                    if remove_self {
-                        locks.push(ownership_lock.clone().write_owned().await);
-                        to_transfer.push(ownership_key.clone());
-                    } else {
-                        // // DO NOT COMPARE WITH 0.
-                        // // This is because the lowest key should not be moved. It belongs to the manager.
-                        if i % 2 == 1 {
-                            locks.push(ownership_lock.clone().write_owned().await);
-                            to_transfer.push(ownership_key.clone());
-                            // Break for lightweight testing.
-                            // break;
-                        }
-                    }
-                }
-                for k in &to_transfer {
-                    ownership.remove(k);
-                }
-                (to_transfer, locks)
-            }
-        };
-        println!("Rescaling: Transferring keys: {to_transfer:?}. RemoveSelf={remove_self}");
-        // Log operation if not recovering.
-        let lsn = match recovery {
-            Some((lsn, _)) => lsn,
-            None => {
-                let log_entry = BTreeLogEntry::Rescaling {
-                    rescaling_uid: rescaling_uid.into(),
-                    to_owner_id: to_owner.into(),
-                    to_transfer: to_transfer.clone(),
-                    remove_self,
-                };
-                let lsn = Recovery::write_log_entry(self.plog.clone(), log_entry).await;
-                lsn
-            }
-        };
-        // Do transfer.
-        for ownership_key in &to_transfer {
-            println!("Rescaling. Removing ownership key: {ownership_key:?}");
-            self.block_cache
-                .remove_ownership_key(ownership_key, false)
-                .await;
-            // Redo the remove here in case we are recovering.
-            if recovery.is_some() {
-                let mut ownership = self.ownership.write().await;
-                ownership.remove(ownership_key);
-            }
-            println!("Rescaling. Removed ownership key: {ownership_key:?}");
-        }
-        println!("Rescaling. Performing Transfer to {to_owner:?}: {to_transfer:?}.");
-        self.global_ownership
-            .perform_ownership_transfer(to_owner, to_transfer)
-            .await;
-        // Write running state.
-        if remove_self {
-            let mut running_state = self.running_state.write().await;
-            running_state.is_active = false;
-            running_state.last_rescaling_uid = rescaling_uid.into();
-            running_state.checkpoint().await;
-            self.global_ownership.remove_load().await;
-        } else {
-            let mut running_state = self.running_state.write().await;
-            running_state.is_active = true;
-            running_state.last_rescaling_uid = rescaling_uid.into();
-            running_state.checkpoint().await;
-            let new_load = self.block_cache.reset_stats().await;
-            self.global_ownership.update_load(new_load).await;
-        }
-        Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
-        println!("Done Rescaling.");
-    }
+    // /// Logic for rescaling.
+    // pub async fn perform_rescaling(
+    //     &self,
+    //     rescaling_uid: &str,
+    //     to_owner: &str,
+    //     remove_self: bool,
+    //     recovery: Option<(usize, Vec<String>)>,
+    // ) {
+    //     let _ownership_change_lock = self.ownership_change_lock.write().await;
+    //     // If not recovering, avoid redo.
+    //     if recovery.is_none() {
+    //         // Do not repeat already performed operation.
+    //         let running_state = self.running_state.read().await;
+    //         if running_state.last_rescaling_uid == rescaling_uid {
+    //             println!("Rescaling. Already done.");
+    //             return;
+    //         }
+    //     }
+    //     // If target of ownership change, mark self as active.
+    //     if to_owner == self.owner_id {
+    //         let new_load = self.block_cache.reset_stats().await;
+    //         self.global_ownership.update_load(new_load).await;
+    //         let this = self.clone();
+    //         this.fetch_new_ownership(true).await; // Lock already held.
+    //         let mut running_state = self.running_state.write().await;
+    //         running_state.last_rescaling_uid = rescaling_uid.into();
+    //         running_state.is_active = true;
+    //         running_state.checkpoint().await;
+    //         return;
+    //     }
+    //     // If source to ownership change, must transfer nodes after guarantees that all ongoing queries are finished.
+    //     let (to_transfer, _locks) = match &recovery {
+    //         Some((_, to_transfer)) => (to_transfer.to_vec(), vec![]),
+    //         None => {
+    //             let mut to_transfer = Vec::new();
+    //             let mut locks = Vec::new();
+    //             let mut ownership = self.ownership.write().await;
+    //             for (i, (ownership_key, ownership_lock)) in ownership.iter().enumerate() {
+    //                 if remove_self {
+    //                     locks.push(ownership_lock.clone().write_owned().await);
+    //                     to_transfer.push(ownership_key.clone());
+    //                 } else {
+    //                     // // DO NOT COMPARE WITH 0.
+    //                     // // This is because the lowest key should not be moved. It belongs to the manager.
+    //                     if i % 2 == 1 {
+    //                         locks.push(ownership_lock.clone().write_owned().await);
+    //                         to_transfer.push(ownership_key.clone());
+    //                         // Break for lightweight testing.
+    //                         // break;
+    //                     }
+    //                 }
+    //             }
+    //             for k in &to_transfer {
+    //                 ownership.remove(k);
+    //             }
+    //             (to_transfer, locks)
+    //         }
+    //     };
+    //     println!("Rescaling: Transferring keys: {to_transfer:?}. RemoveSelf={remove_self}");
+    //     // Log operation if not recovering.
+    //     let lsn = match recovery {
+    //         Some((lsn, _)) => lsn,
+    //         None => {
+    //             let log_entry = BTreeLogEntry::Rescaling {
+    //                 rescaling_uid: rescaling_uid.into(),
+    //                 to_owner_id: to_owner.into(),
+    //                 to_transfer: to_transfer.clone(),
+    //                 remove_self,
+    //             };
+    //             let lsn = Recovery::write_log_entry(self.plog.clone(), log_entry).await;
+    //             lsn
+    //         }
+    //     };
+    //     // Do transfer.
+    //     for ownership_key in &to_transfer {
+    //         println!("Rescaling. Removing ownership key: {ownership_key:?}");
+    //         self.block_cache
+    //             .remove_ownership_key(ownership_key, false)
+    //             .await;
+    //         // Redo the remove here in case we are recovering.
+    //         if recovery.is_some() {
+    //             let mut ownership = self.ownership.write().await;
+    //             ownership.remove(ownership_key);
+    //         }
+    //         println!("Rescaling. Removed ownership key: {ownership_key:?}");
+    //     }
+    //     println!("Rescaling. Performing Transfer to {to_owner:?}: {to_transfer:?}.");
+    //     self.global_ownership
+    //         .perform_ownership_transfer(to_owner, to_transfer)
+    //         .await;
+    //     // Write running state.
+    //     if remove_self {
+    //         let mut running_state = self.running_state.write().await;
+    //         running_state.is_active = false;
+    //         running_state.last_rescaling_uid = rescaling_uid.into();
+    //         running_state.checkpoint().await;
+    //         self.global_ownership.remove_load().await;
+    //     } else {
+    //         let mut running_state = self.running_state.write().await;
+    //         running_state.is_active = true;
+    //         running_state.last_rescaling_uid = rescaling_uid.into();
+    //         running_state.checkpoint().await;
+    //         let new_load = self.block_cache.reset_stats().await;
+    //         self.global_ownership.update_load(new_load).await;
+    //     }
+    //     Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
+    //     println!("Done Rescaling.");
+    // }
 
     /// Handle put logic common to normal operations and recovery.
     pub async fn perform_put(
@@ -1176,7 +1176,6 @@ impl BTreeStructure {
             curr_running_state.checkpoint().await;
         }
         Recovery::wait_for_writes(self.plog.clone(), lsn, vec![], None).await;
-        self.global_ownership.allow_regular_rescaling().await;
     }
 
     pub async fn bulk_load(&self, okeys: Vec<String>, recovery: Option<usize>) {

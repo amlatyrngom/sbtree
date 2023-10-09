@@ -5,9 +5,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
-/// Leaves size (Ideally 256KB, meaning an avg size of 200KB).
+/// Leaves size and inner node size.
 pub const TARGET_LEAF_SIZE: usize = 1 << 18;
-/// Number of inner node children. Ideally scaling unit size should be 32MB-64MB, with ~50MB the average.
 pub const TARGET_INNER_LENGTH: usize = 256;
 /// Moving average
 pub const MOVING_FACTOR: f64 = 0.25;
@@ -80,15 +79,9 @@ impl BlockCache {
             ongoing_writes: HashSet::new(),
             ongoing_writes_queue: HashMap::new(),
         }));
-        let total_mem = std::env::var("MEMORY").unwrap_or_else(|_| "1".into());
+        let total_mem = std::env::var("OBK_MEMORY").unwrap_or_else(|_| "1024".into());
         let mut total_mem: usize = total_mem.parse().unwrap();
         let vcpus: f64 = (total_mem as f64) / 2048.0;
-        if !obelisk::common::has_external_access() {
-            // For lambda.
-            total_mem /= 4;
-        }
-        // 256MB seems to be the amount of memory used as a baseline.
-        total_mem -= 256;
         // Use a percentage of memory as a cache. The rest is handled by os cache.
         total_mem = (total_mem * 1000 * 1000 * 50) / 100;
         // Inner.
@@ -135,7 +128,7 @@ impl BlockCache {
             assert!(inner.unpinned_lru.len() == inner.unpinned.len());
         }
         if let Some(c) = min_unpinned_count {
-            // println!("Checking {}>={c}", inner.unpinned.len());
+            println!("Checking {}>={c}", inner.unpinned.len());
             assert!(inner.unpinned.len() >= c);
             // println!("Comparing unpins: {} and {}", inner.unpinned_lru.len(), inner.unpinned.len());
             assert!(inner.unpinned_lru.len() == inner.unpinned.len());

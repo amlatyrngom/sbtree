@@ -141,6 +141,7 @@ impl BTreeManager {
         match hi {
             None => {}
             Some((hi_id, (_, hi_loss))) => {
+                // For now, prevent more than two nodes. Disable later.
                 if hi_loss >= MANAGER_LOSS_THRESHOLD && loads.len() < 2 {
                     let free_worker = self.global_ownership.get_free_worker().await;
                     println!("Manager: Splitting({hi_id}, to={free_worker}).");
@@ -163,7 +164,7 @@ impl BTreeManager {
                 match next_lo {
                     None => {}
                     Some((next_id, (next_gain, _))) => {
-                        let (lo_id, next_id) = if lo_id == "manager" {
+                        let (lo_id, next_id) = if lo_id == MANAGER_ID {
                             // Never scale in manager.
                             (next_id, lo_id)
                         } else {

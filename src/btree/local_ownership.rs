@@ -413,24 +413,24 @@ impl LocalOwnership {
                     continue;
                 }
             };
-            match conn.pragma_update(None, "locking_mode", "exclusive") {
-                Ok(_) => {}
-                Err(x) => {
-                    println!("NewLocalOwnership Pragma1 {ownership_key:?}: {x:?}");
-                    let file = std::fs::File::open(&db_file);
-                    println!("File: {file:?}");
-                    continue;
-                }
-            }
-            match conn.pragma_update(None, "journal_mode", "wal") {
-                Ok(_) => {}
-                Err(x) => {
-                    println!("NewLocalOwnership Pragma2 {ownership_key:?}: {x:?}");
-                    let file = std::fs::File::open(&db_file);
-                    println!("File: {file:?}");
-                    continue;
-                }
-            }
+            // match conn.pragma_update(None, "locking_mode", "exclusive") {
+            //     Ok(_) => {}
+            //     Err(x) => {
+            //         println!("NewLocalOwnership Pragma1 {ownership_key:?}: {x:?}");
+            //         let file = std::fs::File::open(&db_file);
+            //         println!("File: {file:?}");
+            //         continue;
+            //     }
+            // }
+            // match conn.pragma_update(None, "journal_mode", "wal") {
+            //     Ok(_) => {}
+            //     Err(x) => {
+            //         println!("NewLocalOwnership Pragma2 {ownership_key:?}: {x:?}");
+            //         let file = std::fs::File::open(&db_file);
+            //         println!("File: {file:?}");
+            //         continue;
+            //     }
+            // }
             let txn = match conn.transaction() {
                 Ok(txn) => txn,
                 Err(x) => {

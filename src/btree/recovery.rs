@@ -45,7 +45,7 @@ impl RunningState {
             is_active: self.is_active,
         };
         let log_entry = bincode::serialize(&log_entry).unwrap();
-        self.plog.enqueue(log_entry).await;
+        self.plog.enqueue(log_entry, Some(512)).await;
         self.plog.flush().await;
     }
 }
@@ -290,21 +290,21 @@ impl Recovery {
                     )
                     .await;
                 }
-                BTreeLogEntry::Rescaling {
-                    rescaling_uid,
-                    to_owner_id,
-                    to_transfer,
-                    remove_self,
-                } => {
-                    self.recover_rescaling(
-                        lsn,
-                        &rescaling_uid,
-                        &to_owner_id,
-                        to_transfer,
-                        remove_self,
-                    )
-                    .await;
-                }
+                // BTreeLogEntry::Rescaling {
+                //     rescaling_uid,
+                //     to_owner_id,
+                //     to_transfer,
+                //     remove_self,
+                // } => {
+                //     self.recover_rescaling(
+                //         lsn,
+                //         &rescaling_uid,
+                //         &to_owner_id,
+                //         to_transfer,
+                //         remove_self,
+                //     )
+                //     .await;
+                // }
                 BTreeLogEntry::DeleteAll => {
                     self.recover_delete_all(lsn).await;
                 }
@@ -332,24 +332,24 @@ impl Recovery {
     }
 
     /// Recover rescaling.
-    async fn recover_rescaling(
-        &mut self,
-        lsn: usize,
-        rescaling_uid: &str,
-        to_owner: &str,
-        to_transfer: Vec<String>,
-        remove_self: bool,
-    ) {
-        let _recovery_exclusive = self.recovery_lock.clone().write_owned().await;
-        self.tree_structure
-            .perform_rescaling(
-                rescaling_uid,
-                to_owner,
-                remove_self,
-                Some((lsn, to_transfer)),
-            )
-            .await;
-    }
+    // async fn recover_rescaling(
+    //     &mut self,
+    //     lsn: usize,
+    //     rescaling_uid: &str,
+    //     to_owner: &str,
+    //     to_transfer: Vec<String>,
+    //     remove_self: bool,
+    // ) {
+    //     let _recovery_exclusive = self.recovery_lock.clone().write_owned().await;
+    //     self.tree_structure
+    //         .perform_rescaling(
+    //             rescaling_uid,
+    //             to_owner,
+    //             remove_self,
+    //             Some((lsn, to_transfer)),
+    //         )
+    //         .await;
+    // }
 
     /// Recover merge.
     async fn recover_merge_root(
@@ -571,7 +571,7 @@ impl Recovery {
     /// Write log entry and wait for it to be flushed.
     pub async fn write_log_entry(plog: Arc<PersistentLog>, log_entry: BTreeLogEntry) -> usize {
         let log_entry = bincode::serialize(&log_entry).unwrap();
-        let lsn = plog.enqueue(log_entry).await;
+        let lsn = plog.enqueue(log_entry, Some(512)).await;
         // let start_time = std::time::Instant::now();
         plog.flush_at(Some(lsn)).await;
         // let end_time = std::time::Instant::now();
