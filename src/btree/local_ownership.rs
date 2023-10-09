@@ -296,19 +296,21 @@ impl LocalOwnership {
         self.vacuum().await;
     }
 
-    async fn vacuum(&self) {
-        tokio::task::block_in_place(move || {
+    pub async fn vacuum(&self) {
+        let pool = self.pool.clone();
+        let _ = tokio::task::spawn_blocking(move || {
             let conn = loop {
-                match self.pool.get() {
+                match pool.get() {
                     Ok(conn) => break conn,
                     Err(x) => {
-                        println!("MoveBlocks: {x:?}");
+                        println!("Vacuum: {x:?}");
                         continue;
                     }
                 };
             };
             let _resp = conn.execute("VACUUM", []);
-        });
+        })
+        .await;
     }
 
     /// Release lock on file.

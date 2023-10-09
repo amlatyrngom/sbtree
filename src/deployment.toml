@@ -10,14 +10,14 @@ mem = 3538
 timeout = 30
 persistent = true
 unique = true
-scaleup = 1.0
+scaleup = 0.0
 
 
-# [[handlers]]
-# name = "sbbench"
-# subsystem = "functional"
-# path = "sbtree::BenchFn"
-# mem = 512
-# scaleup = -1.0
-# timeout = 30
-# concurrency = 1
+[[handlers]]
+name = "sbbench"
+subsystem = "functional"
+path = "sbtree::BenchFn"
+mem = 512
+scaleup = -1.0
+timeout = 30
+concurrency = 1

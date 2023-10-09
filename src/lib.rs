@@ -1,7 +1,7 @@
-mod bench_fn;
 mod btree;
 mod client;
 mod global_ownership;
+pub use btree::btree_bench::BenchFn;
 pub use btree::BTreeActor;
 pub use client::BTreeClient;
 

@@ -196,7 +196,7 @@ impl GlobalOwnership {
         let shared_config = aws_config::load_from_env().await;
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
         // key-value table.
-        let resp = dynamo_client
+        let request = dynamo_client
             .create_table()
             .table_name(table_name)
             .billing_mode(BillingMode::PayPerRequest)
@@ -206,26 +206,30 @@ impl GlobalOwnership {
                     .key_type(KeyType::Hash)
                     .build(),
             )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(skey)
-                    .key_type(KeyType::Range)
-                    .build(),
-            )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name(pkey)
                     .attribute_type(ScalarAttributeType::S)
                     .build(),
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(skey)
-                    .attribute_type(ScalarAttributeType::S)
-                    .build(),
-            )
-            .send()
-            .await;
+            );
+        let request = if !skey.is_empty() {
+            request
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name(skey)
+                        .key_type(KeyType::Range)
+                        .build(),
+                )
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name(skey)
+                        .attribute_type(ScalarAttributeType::S)
+                        .build(),
+                )
+        } else {
+            request
+        };
+        let resp = request.send().await;
         if resp.is_err() {
             let err = format!("{resp:?}");
             if !err.contains("ResourceInUseException") {
@@ -250,6 +254,7 @@ impl GlobalOwnership {
         let create1 =
             Self::make_table_if_not_exist("sbtree_ownership", "owner_id", "ownership_key");
         let create2 = Self::make_table_if_not_exist("sbtree_rescaling", "entry_type", "owner_id");
-        tokio::join!(create1, create2);
+        let create3 = Self::make_table_if_not_exist("dynamo_bench", "key", "");
+        tokio::join!(create1, create2, create3);
     }
 }

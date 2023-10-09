@@ -1,5 +1,5 @@
 mod block;
-mod btree_bench;
+pub mod btree_bench;
 mod btree_test;
 mod local_ownership;
 // mod manager;
@@ -203,23 +203,22 @@ impl ServerlessHandler for BTreeActor {
     async fn checkpoint(&self, _scaling_state: &ScalingState, terminating: bool) {
         println!("Checkpointing: termination={terminating}.");
         let tree_structure = self.tree_structure.clone();
-        // SIGTERMs seem temporarily broken. Quick fix.
-        if !self.is_lambda {
-            let mem = std::env::var("OBK_MEMORY").unwrap_or("4096".into());
-            let mem: i32 = mem.parse().unwrap();
-            let handler_state = _scaling_state.handler_state.clone().unwrap();
-            if *handler_state.handler_scales.get(&mem).unwrap() == 0 {
-                println!("Should be terminating!!!!");
-                // let already_terminating = self.terminating.load(atomic::Ordering::Acquire);
-                // if already_terminating {
-                //     return;
-                // }
-                // self.terminating.store(true, atomic::Ordering::Release);
-                // tokio::spawn(async move {
-                //     clean_die("Manual SIGTERM").await;
-                // });
-            }
-        }
+        // // TODO: ECS SIGTERMs seem temporarily broken. Quick fix.
+        // if !self.is_lambda {
+        //     let mem = std::env::var("OBK_MEMORY").unwrap_or("4096".into());
+        //     let mem: i32 = mem.parse().unwrap();
+        //     let handler_state = _scaling_state.handler_state.clone().unwrap();
+        //     if *handler_state.handler_scales.get(&mem).unwrap() == 0 {
+        //         println!("Should be terminating!!!!");
+        //         let already_terminating = self.terminating.fetch_or(true, atomic::Ordering::AcqRel);
+        //         if !already_terminating {
+        //             println!("Sending manual SIGTERM.");
+        //             tokio::spawn(async move {
+        //                 clean_die("manual termination").await;
+        //             });
+        //         }
+        //     }
+        // }
         if terminating {
             tree_structure.plog.terminate().await;
             self.terminating.store(true, atomic::Ordering::Release);
